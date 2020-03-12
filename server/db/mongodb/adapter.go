@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -987,6 +988,19 @@ func (a *adapter) AuthGetUniqueRecord(unique string) (t.Uid, auth.Level, []byte,
 	}
 
 	filter := b.M{"_id": unique}
+	if strings.HasPrefix(unique, "phone") {
+		phone := strings.Split(unique, ":")[1]
+
+		var pattern string
+		if strings.HasSuffix(unique, "temp") {
+			pattern = ".*:" + regexp.QuoteMeta(phone) + ":.*"
+		} else {
+			pattern = ".*:" + regexp.QuoteMeta(phone) + ".*"
+		}
+
+		filter = b.M{"_id": b.M{"$regex": primitive.Regex{Pattern: pattern}}}
+	}
+
 	findOpts := mdbopts.FindOne().SetProjection(b.M{
 		"userid":  1,
 		"authlvl": 1,
