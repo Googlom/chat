@@ -262,6 +262,8 @@ func decodeStoreError(err error, id, topic string, timestamp time.Time,
 			errmsg = ErrNotImplemented(id, topic, timestamp)
 		case types.ErrExpired:
 			errmsg = ErrExpired(id, topic, timestamp)
+		case types.ErrTimerNotExpired:
+			errmsg = ErrTimerNotExpired(id, topic, timestamp)
 		case types.ErrPolicy:
 			errmsg = ErrPolicy(id, topic, timestamp)
 		case types.ErrCredentials:

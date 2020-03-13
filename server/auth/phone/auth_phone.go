@@ -21,6 +21,9 @@ type authenticator struct {
 	// Logical name of this authenticator
 	name      string
 	addToTags bool
+
+	// key = phoneNumber
+	smsTimers map[string]*time.Timer
 }
 
 const (
@@ -47,6 +50,7 @@ func (a *authenticator) Init(jsonconf json.RawMessage, name string) error {
 
 	a.addToTags = config.AddToTags
 	a.name = name
+	a.smsTimers = map[string]*time.Timer{}
 
 	return nil
 }
@@ -83,6 +87,30 @@ func sendSMS(to, code string) error {
 	return nil
 }
 
+// TODO: Move this functionality to db adapter
+func (a *authenticator) deleteTempRecord(phoneNumber string) {
+	uid, _, _, _, _ := store.Users.GetAuthUniqueRecord("phone", phoneNumber)
+	if uid.IsZero() {
+		// There is no persistent auth record (user incomplete).
+		// Get Uid from temporary record and delete previously created user and auth record.
+		uid, _, _, _, _ = store.Users.GetAuthUniqueRecord("phone_temp", phoneNumber)
+		_ = store.Users.Delete(uid, true)
+	}
+
+	// There is a persistent auth record (user complete).
+	// Just delete temporary record
+	_ = store.Users.DelAuthRecords(uid, "phone_temp")
+}
+
+func (a *authenticator) startTimerForPhone(phoneNumber string, dur time.Duration) {
+	a.smsTimers[phoneNumber] = time.AfterFunc(dur, func() {
+		a.deleteTempRecord(phoneNumber)
+
+		// reset the timer for this phone number
+		delete(a.smsTimers, phoneNumber)
+	})
+}
+
 func (a *authenticator) addRecord(rec *auth.Rec, phoneNumber string) (*auth.Rec, error) {
 	response := genResponse()
 
@@ -93,24 +121,28 @@ func (a *authenticator) addRecord(rec *auth.Rec, phoneNumber string) (*auth.Rec,
 
 	if err := store.Users.AddAuthRecord(rec.Uid,
 		auth.LevelAnon,
-		a.name,
-		phoneNumber+":temp",
+		a.name+"_temp",
+		phoneNumber,
 		[]byte(response),
 		types.TimeNow().Add(rec.Lifetime),
 	); err != nil {
 		return nil, err
 	}
 
+	a.startTimerForPhone(phoneNumber, rec.Lifetime)
 	_ = sendSMS(phoneNumber, response)
+
 	return rec, nil
 }
 
-// AddRecord adds persistent authentication record to the database.
-// Returns: updated auth record, error
 func (a *authenticator) AddRecord(rec *auth.Rec, secret []byte) (*auth.Rec, error) {
 	phoneNumber, _, err := parseSecret(secret)
 	if err != nil {
 		return nil, err
+	}
+
+	if _, ok := a.smsTimers[phoneNumber]; ok {
+		return rec, types.ErrTimerNotExpired
 	}
 
 	return a.addRecord(rec, phoneNumber)
@@ -121,10 +153,20 @@ func (a *authenticator) UpdateRecord(rec *auth.Rec, secret []byte) (*auth.Rec, e
 	return rec, nil
 }
 
+func (a *authenticator) updateRecord(rec *auth.Rec, phoneNumber string) error {
+	err := store.Users.AddAuthRecord(rec.Uid, rec.AuthLevel, a.name, phoneNumber, nil, time.Time{})
+	if err != nil && err == types.ErrDuplicate {
+		// Do nothing if record exists - no values should change during 'update'
+		return nil
+	}
+
+	return err
+}
+
 func (a *authenticator) getAuthDetails(phoneNumber string, tempOnly bool) (types.Uid, string, time.Time, error) {
 	if tempOnly {
 		// get temporary (unconfirmed) record
-		uid, _, needResp, expires, err := store.Users.GetAuthUniqueRecord(a.name, phoneNumber+":temp")
+		uid, _, needResp, expires, err := store.Users.GetAuthUniqueRecord(a.name+"_temp", phoneNumber)
 		return uid, string(needResp), expires, err
 	} else {
 		// get persistent or temp record
@@ -133,7 +175,6 @@ func (a *authenticator) getAuthDetails(phoneNumber string, tempOnly bool) (types
 	}
 }
 
-// Authenticate: get user record by provided secret
 func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 	phoneNumber, response, err := parseSecret(secret)
 	if err != nil {
@@ -141,6 +182,10 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 	}
 
 	if response == "" {
+		if _, ok := a.smsTimers[phoneNumber]; ok {
+			return nil, nil, types.ErrTimerNotExpired
+		}
+
 		uid, _, _, err := a.getAuthDetails(phoneNumber, false)
 		if err != nil {
 			return nil, nil, err
@@ -172,7 +217,7 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 
 		if !expires.IsZero() && expires.Before(time.Now()) {
 			// The record has expired
-			// TODO: Delete expired record here too
+			a.deleteTempRecord(phoneNumber)
 			return nil, nil, types.ErrExpired
 		}
 
@@ -186,14 +231,13 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 		rec.AuthLevel = auth.LevelAuth
 		rec.Features = auth.FeatureValidated
 
-		err = store.Users.UpdateAuthRecord(rec.Uid, rec.AuthLevel, a.name, phoneNumber, nil, time.Time{})
-		//TODO: delete temp auth and make current persistent (expire = Zero, secret = nil)
+		err = a.updateRecord(rec, phoneNumber)
+		//a.deleteTempRecord(phoneNumber)
 		return rec, nil, err
 	}
 }
 
 // IsUnique verifies if the provided secret can be considered unique by the auth scheme
-// E.g. if login is unique.
 func (a *authenticator) IsUnique(secret []byte) (bool, error) {
 	phoneNumber, _, err := parseSecret(secret)
 	if err != nil {
