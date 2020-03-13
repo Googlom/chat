@@ -54,6 +54,7 @@ func (a *authenticator) Init(jsonconf json.RawMessage, name string) error {
 	return nil
 }
 
+// Parse incoming secret to phone number and response code. Example: +999887766554:123456
 func parseSecret(bsecret []byte) (string, string, error) {
 	secret := string(bsecret)
 	var phoneNumber, response string
@@ -74,76 +75,21 @@ func parseSecret(bsecret []byte) (string, string, error) {
 	return phoneNumber, response, nil
 }
 
+// genResponse generates expected response as a random numeric string between 0 and 999999
 func genResponse() string {
-	// Generate expected response as a random numeric string between 0 and 999999
 	r, _ := rand.Int(rand.Reader, big.NewInt(int64(maxCodeValue)))
 	randString := r.String()
 	return strings.Repeat("0", codeLength-len(randString)) + randString
 }
 
+// TODO: implement
+// Actually send SMS with response code
 func sendSMS(to, code string) error {
 	log.Printf("<<<SMS>>> Sent to %s with code '%s' ", to, code)
 	return nil
 }
 
 func (a *authenticator) startTimerForPhone(phoneNumber string, dur time.Duration) {
-	a.smsTimers[phoneNumber] = time.AfterFunc(dur, func() {
-		store.Users.AuthDelPhoneTemp(phoneNumber)
-
-		// reset the timer for this phone number
-		delete(a.smsTimers, phoneNumber)
-	})
-}
-
-func (a *authenticator) addRecord(rec *auth.Rec, phoneNumber string) (*auth.Rec, error) {
-	response := genResponse()
-
-	rec.Features = auth.FeatureNoLogin
-	rec.AuthLevel = auth.LevelAnon
-	// TODO: make lifetime period configurable
-	rec.Lifetime = 60 * time.Second
-
-	if err := store.Users.AddAuthRecord(rec.Uid,
-		auth.LevelAnon,
-		a.name+"_temp",
-		phoneNumber,
-		[]byte(response),
-		types.TimeNow().Add(rec.Lifetime),
-	); err != nil {
-		return nil, err
-	}
-
-	a.startTimerForPhone(phoneNumber, rec.Lifetime)
-	_ = sendSMS(phoneNumber, response)
-
-	return rec, nil
-}
-
-func (a *authenticator) AddRecord(rec *auth.Rec, secret []byte) (*auth.Rec, error) {
-	phoneNumber, _, err := parseSecret(secret)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, ok := a.smsTimers[phoneNumber]; ok {
-		return rec, types.ErrTimerNotExpired
-	}
-
-	return a.addRecord(rec, phoneNumber)
-}
-
-func (a *authenticator) UpdateRecord(rec *auth.Rec, secret []byte) (*auth.Rec, error) {
-	return rec, nil
-}
-
-func (a *authenticator) updateRecord(rec *auth.Rec, phoneNumber string) error {
-	err := store.Users.AddAuthRecord(rec.Uid, rec.AuthLevel, a.name, phoneNumber, nil, time.Time{})
-	if err != nil && err == types.ErrDuplicate {
-		// Do nothing if record exists - no values should change during 'update'
-		return nil
-	}
-
-	return err
 }
 
 func (a *authenticator) getAuthDetails(phoneNumber string, tempOnly bool) (types.Uid, string, time.Time, error) {
@@ -158,6 +104,66 @@ func (a *authenticator) getAuthDetails(phoneNumber string, tempOnly bool) (types
 	}
 }
 
+func (a *authenticator) addRecord(rec *auth.Rec, phoneNumber string) (*auth.Rec, error) {
+	// Now we are creating temp record that will be deleted after successfull confirmation or timer expiry
+	rec.Features = auth.FeatureNoLogin
+	rec.AuthLevel = auth.LevelAnon
+	// TODO: make lifetime period configurable
+	rec.Lifetime = 60 * time.Second
+
+	response := genResponse()
+	if err := store.Users.AddAuthRecord(rec.Uid,
+		auth.LevelAnon,
+		a.name+"_temp",
+		phoneNumber,
+		[]byte(response),
+		types.TimeNow().Add(rec.Lifetime),
+	); err != nil {
+		return nil, err
+	}
+
+	// Start timer which will delete unconfirmed record after it expires.
+	a.smsTimers[phoneNumber] = time.AfterFunc(rec.Lifetime, func() {
+		store.Users.AuthDelPhoneTemp(phoneNumber)
+
+		// reset the timer for this phone number
+		delete(a.smsTimers, phoneNumber)
+	})
+	// TODO: Send sms in goroutine with error responding
+	_ = sendSMS(phoneNumber, response)
+
+	return rec, nil
+}
+
+// updateRecord makes temporary record persistent
+func (a *authenticator) updateRecord(rec *auth.Rec, phoneNumber string) error {
+	err := store.Users.AddAuthRecord(rec.Uid, rec.AuthLevel, a.name, phoneNumber, nil, time.Time{})
+	if err != nil && err == types.ErrDuplicate {
+		// Do nothing if record exists - no values should change during 'update'
+		return nil
+	}
+
+	return err
+}
+
+// AddRecord used only when creating new user
+func (a *authenticator) AddRecord(rec *auth.Rec, secret []byte) (*auth.Rec, error) {
+	phoneNumber, _, err := parseSecret(secret)
+	if err != nil {
+		return nil, err
+	}
+
+	// Prevent creating another record before first expires
+	if _, ok := a.smsTimers[phoneNumber]; ok {
+		return rec, types.ErrTimerNotExpired
+	}
+
+	return a.addRecord(rec, phoneNumber)
+}
+
+// Authenticate used in two ways:
+// 1) Requesting sms code to log in from new device. In this case secret should contain only phone number
+// 2) Confirming phone number. In this case secret should be in format "phoneNumber:responseCode"
 func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 	phoneNumber, response, err := parseSecret(secret)
 	if err != nil {
@@ -165,6 +171,8 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 	}
 
 	if response == "" {
+		// 1) Requesting sms code
+
 		if _, ok := a.smsTimers[phoneNumber]; ok {
 			return nil, nil, types.ErrTimerNotExpired
 		}
@@ -175,20 +183,20 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 		}
 
 		if uid.IsZero() {
+			// No auth record in DB
 			return nil, nil, types.ErrFailed
 		}
 
 		// start by creating temporary auth record in db which will be deleted after successfull confirmation or expiry
 		rec := new(auth.Rec)
 		rec.Uid = uid
-
-		// SMS request
 		rec, err = a.addRecord(rec, phoneNumber)
+
 		return rec, []byte("validate credentials"), err
 	} else {
-		// confirmation request
+		//2) Confirming phone number.
 
-		uid, needResp, expires, err := a.getAuthDetails(phoneNumber, true)
+		uid, expected, expires, err := a.getAuthDetails(phoneNumber, true)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -204,7 +212,7 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 			return nil, nil, types.ErrExpired
 		}
 
-		if response != needResp {
+		if response != expected {
 			return nil, nil, types.ErrInvalidResponse
 		}
 
@@ -217,7 +225,7 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 		err = a.updateRecord(rec, phoneNumber)
 		store.Users.AuthDelPhoneTemp(phoneNumber)
 
-		// Stop the timer to prevent call store.Users.AuthDelPhoneTemp(phoneNumber) again.
+		// Stop the timer to prevent calling store.Users.AuthDelPhoneTemp() again.
 		a.smsTimers[phoneNumber].Stop()
 		delete(a.smsTimers, phoneNumber)
 
@@ -244,14 +252,6 @@ func (a *authenticator) IsUnique(secret []byte) (bool, error) {
 	return true, nil
 }
 
-func (a *authenticator) GenSecret(rec *auth.Rec) ([]byte, time.Time, error) {
-	return nil, time.Time{}, types.ErrUnsupported
-}
-
-func (a *authenticator) DelRecords(uid types.Uid) error {
-	return nil
-}
-
 // RestrictedTags returns tag namespaces restricted by the server.
 func (a *authenticator) RestrictedTags() ([]string, error) {
 	var tags []string
@@ -261,10 +261,23 @@ func (a *authenticator) RestrictedTags() ([]string, error) {
 	return tags, nil
 }
 
-func (authenticator) GetResetParams(uid types.Uid) (map[string]interface{}, error) {
-	return nil, nil
-}
-
 func init() {
 	store.RegisterAuthScheme("phone", &authenticator{})
+}
+
+// Below methods are unused by this authenticator
+func (a *authenticator) UpdateRecord(rec *auth.Rec, secret []byte) (*auth.Rec, error) {
+	return rec, nil
+}
+
+func (a *authenticator) GenSecret(rec *auth.Rec) ([]byte, time.Time, error) {
+	return nil, time.Time{}, types.ErrUnsupported
+}
+
+func (a *authenticator) DelRecords(uid types.Uid) error {
+	return nil
+}
+
+func (authenticator) GetResetParams(uid types.Uid) (map[string]interface{}, error) {
+	return nil, nil
 }
