@@ -104,7 +104,7 @@ func (a *authenticator) deleteTempRecord(phoneNumber string) {
 
 func (a *authenticator) startTimerForPhone(phoneNumber string, dur time.Duration) {
 	a.smsTimers[phoneNumber] = time.AfterFunc(dur, func() {
-		a.deleteTempRecord(phoneNumber)
+		store.Users.AuthDelPhoneTemp(phoneNumber)
 
 		// reset the timer for this phone number
 		delete(a.smsTimers, phoneNumber)
@@ -217,7 +217,7 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 
 		if !expires.IsZero() && expires.Before(time.Now()) {
 			// The record has expired
-			a.deleteTempRecord(phoneNumber)
+			store.Users.AuthDelPhoneTemp(phoneNumber)
 			return nil, nil, types.ErrExpired
 		}
 
@@ -232,7 +232,12 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 		rec.Features = auth.FeatureValidated
 
 		err = a.updateRecord(rec, phoneNumber)
-		//a.deleteTempRecord(phoneNumber)
+		store.Users.AuthDelPhoneTemp(phoneNumber)
+
+		// Stop the timer to prevent call store.Users.AuthDelPhoneTemp(phoneNumber) again.
+		a.smsTimers[phoneNumber].Stop()
+		delete(a.smsTimers, phoneNumber)
+
 		return rec, nil, err
 	}
 }

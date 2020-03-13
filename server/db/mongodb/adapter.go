@@ -995,10 +995,10 @@ func (a *adapter) AuthGetUniqueRecord(unique string) (t.Uid, auth.Level, []byte,
 		// find only temporary record
 		filter = b.M{"_id": unique}
 	} else if strings.HasPrefix(unique, "phone:") {
-		phoneNumber := strings.Split(unique, ":")[0]
+		phoneNumber := strings.Split(unique, ":")[1]
 		// find persistent or temporary record
 		// regex pattern example = `(phone|phone_temp):\+1234567890
-		pattern := regexp.QuoteMeta("(phone|phone_temp):" + phoneNumber)
+		pattern := "(phone|phone_temp):" + regexp.QuoteMeta(phoneNumber)
 		filter = b.M{"_id": b.M{"$regex": primitive.Regex{Pattern: pattern}}}
 	}
 
@@ -1080,6 +1080,21 @@ func (a *adapter) authDelAllRecords(ctx context.Context, uid t.Uid) (int, error)
 // AuthDelAllRecords deletes all records of a given user.
 func (a *adapter) AuthDelAllRecords(uid t.Uid) (int, error) {
 	return a.authDelAllRecords(a.ctx, uid)
+}
+
+// AuthDelPhoneTemp deletes unconfirmed (temp) records (for phone scheme only)
+func (a *adapter) AuthDelPhoneTemp(phone string) {
+	uid, _, _, _, _ := a.AuthGetUniqueRecord("phone:" + phone)
+	if uid.IsZero() {
+		// There is no persistent auth record (user incomplete).
+		// Get Uid from temporary record and delete previously created user and auth record.
+		uid, _, _, _, _ = a.AuthGetUniqueRecord("phone_temp:" + phone)
+		_, _ = a.db.Collection("users").DeleteOne(a.ctx, b.M{"_id": uid.String()})
+	}
+
+	// There is a persistent auth record (user complete).
+	// Just delete temporary record
+	_ = a.AuthDelScheme(uid, "phone_temp")
 }
 
 // AuthUpdRecord modifies an authentication record.
