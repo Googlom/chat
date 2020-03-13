@@ -988,17 +988,19 @@ func (a *adapter) AuthGetUniqueRecord(unique string) (t.Uid, auth.Level, []byte,
 	}
 
 	filter := b.M{"_id": unique}
+
 	if strings.HasPrefix(unique, "phone") {
-		phone := strings.Split(unique, ":")[1]
+		// unique = phone:{phonenumber}:temp  OR
+		// unique = phone:{phonenumber}
 
-		var pattern string
 		if strings.HasSuffix(unique, "temp") {
-			pattern = ".*:" + regexp.QuoteMeta(phone) + ":.*"
+			// find only temporary record
+			filter = b.M{"_id": unique}
 		} else {
-			pattern = ".*:" + regexp.QuoteMeta(phone) + ".*"
+			// find persistent or temporary record
+			// regex pattern example = `phone:\+999876543210.*
+			filter = b.M{"_id": b.M{"$regex": primitive.Regex{Pattern: regexp.QuoteMeta(unique) + ".*"}}}
 		}
-
-		filter = b.M{"_id": b.M{"$regex": primitive.Regex{Pattern: pattern}}}
 	}
 
 	findOpts := mdbopts.FindOne().SetProjection(b.M{

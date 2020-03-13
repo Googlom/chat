@@ -94,7 +94,7 @@ func (a *authenticator) addRecord(rec *auth.Rec, phoneNumber string) (*auth.Rec,
 	if err := store.Users.AddAuthRecord(rec.Uid,
 		auth.LevelAnon,
 		a.name,
-		phoneNumber+":"+response,
+		phoneNumber+":temp",
 		[]byte(response),
 		types.TimeNow().Add(rec.Lifetime),
 	); err != nil {
@@ -121,6 +121,18 @@ func (a *authenticator) UpdateRecord(rec *auth.Rec, secret []byte) (*auth.Rec, e
 	return rec, nil
 }
 
+func (a *authenticator) getAuthDetails(phoneNumber string, tempOnly bool) (types.Uid, string, time.Time, error) {
+	if tempOnly {
+		// get temporary (unconfirmed) record
+		uid, _, needResp, expires, err := store.Users.GetAuthUniqueRecord(a.name, phoneNumber+":temp")
+		return uid, string(needResp), expires, err
+	} else {
+		// get persistent or temp record
+		uid, _, needResp, _, err := store.Users.GetAuthUniqueRecord(a.name, phoneNumber)
+		return uid, string(needResp), time.Time{}, err
+	}
+}
+
 // Authenticate: get user record by provided secret
 func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 	phoneNumber, response, err := parseSecret(secret)
@@ -128,49 +140,55 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 		return nil, nil, err
 	}
 
-	uid, _, needResp, expires, err := store.Users.GetAuthUniqueRecord(a.name, phoneNumber+":temp")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if uid.IsZero() {
-		return nil, nil, types.ErrUserNotFound
-	}
-
-	if !expires.IsZero() && expires.Before(time.Now()) {
-		// The record has expired
-		// TODO: Delete expired record here too
-		return nil, nil, types.ErrExpired
-	}
-
-	// start by creating temporary auth record which will be deleted after successfull confirmation or expiry
-	rec := auth.Rec{
-		Uid: uid,
-	}
-
 	if response == "" {
-		// SMS request
-		rec, err := a.addRecord(&rec, phoneNumber)
-		return rec, nil, err
-	} else {
-		// confirmation request
+		uid, _, _, err := a.getAuthDetails(phoneNumber, false)
+		if err != nil {
+			return nil, nil, err
+		}
 
-		// Persistent (confirmed) auth records have no expire time
-		if expires.IsZero() {
+		if uid.IsZero() {
 			return nil, nil, types.ErrFailed
 		}
 
-		if response != string(needResp) {
+		// start by creating temporary auth record in db which will be deleted after successfull confirmation or expiry
+		rec := new(auth.Rec)
+		rec.Uid = uid
+
+		// SMS request
+		rec, err = a.addRecord(rec, phoneNumber)
+		return rec, []byte("validate credentials"), err
+	} else {
+		// confirmation request
+
+		uid, needResp, expires, err := a.getAuthDetails(phoneNumber, true)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if uid.IsZero() {
+			// There is no temporary record in db
+			return nil, nil, types.ErrFailed
+		}
+
+		if !expires.IsZero() && expires.Before(time.Now()) {
+			// The record has expired
+			// TODO: Delete expired record here too
+			return nil, nil, types.ErrExpired
+		}
+
+		if response != needResp {
 			return nil, nil, types.ErrInvalidResponse
 		}
 
 		// Confirmation successfull
+		rec := new(auth.Rec)
+		rec.Uid = uid
 		rec.AuthLevel = auth.LevelAuth
 		rec.Features = auth.FeatureValidated
 
 		err = store.Users.UpdateAuthRecord(rec.Uid, rec.AuthLevel, a.name, phoneNumber, nil, time.Time{})
 		//TODO: delete temp auth and make current persistent (expire = Zero, secret = nil)
-		return &rec, nil, err
+		return rec, nil, err
 	}
 }
 
