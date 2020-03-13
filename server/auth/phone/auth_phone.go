@@ -22,12 +22,11 @@ type authenticator struct {
 	name      string
 	addToTags bool
 
-	// key = phoneNumber
+	// key is phone number
 	smsTimers map[string]*time.Timer
 }
 
 const (
-	// codeLength = log10(maxCodeValue)
 	codeLength   = 6
 	maxCodeValue = 999999
 )
@@ -87,21 +86,6 @@ func sendSMS(to, code string) error {
 	return nil
 }
 
-// TODO: Move this functionality to db adapter
-func (a *authenticator) deleteTempRecord(phoneNumber string) {
-	uid, _, _, _, _ := store.Users.GetAuthUniqueRecord("phone", phoneNumber)
-	if uid.IsZero() {
-		// There is no persistent auth record (user incomplete).
-		// Get Uid from temporary record and delete previously created user and auth record.
-		uid, _, _, _, _ = store.Users.GetAuthUniqueRecord("phone_temp", phoneNumber)
-		_ = store.Users.Delete(uid, true)
-	}
-
-	// There is a persistent auth record (user complete).
-	// Just delete temporary record
-	_ = store.Users.DelAuthRecords(uid, "phone_temp")
-}
-
 func (a *authenticator) startTimerForPhone(phoneNumber string, dur time.Duration) {
 	a.smsTimers[phoneNumber] = time.AfterFunc(dur, func() {
 		store.Users.AuthDelPhoneTemp(phoneNumber)
@@ -148,7 +132,6 @@ func (a *authenticator) AddRecord(rec *auth.Rec, secret []byte) (*auth.Rec, erro
 	return a.addRecord(rec, phoneNumber)
 }
 
-// UpdateRecord updates existing record with new credentials.
 func (a *authenticator) UpdateRecord(rec *auth.Rec, secret []byte) (*auth.Rec, error) {
 	return rec, nil
 }
@@ -242,7 +225,7 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 	}
 }
 
-// IsUnique verifies if the provided secret can be considered unique by the auth scheme
+// IsUnique verifies if the provided phone number considered unique
 func (a *authenticator) IsUnique(secret []byte) (bool, error) {
 	phoneNumber, _, err := parseSecret(secret)
 	if err != nil {
@@ -261,14 +244,11 @@ func (a *authenticator) IsUnique(secret []byte) (bool, error) {
 	return true, nil
 }
 
-// GenSecret generates a new secret, if appropriate.
 func (a *authenticator) GenSecret(rec *auth.Rec) ([]byte, time.Time, error) {
 	return nil, time.Time{}, types.ErrUnsupported
 }
 
-// DelRecords deletes all authentication records for the given user.
 func (a *authenticator) DelRecords(uid types.Uid) error {
-	//return store.Users.DelAuthRecords(uid, a.name)
 	return nil
 }
 
@@ -281,10 +261,7 @@ func (a *authenticator) RestrictedTags() ([]string, error) {
 	return tags, nil
 }
 
-// GetResetParams returns authenticator parameters passed to password reset handler
-// (none for rest).
 func (authenticator) GetResetParams(uid types.Uid) (map[string]interface{}, error) {
-	// TODO: route request to the server.
 	return nil, nil
 }
 
