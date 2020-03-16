@@ -83,6 +83,8 @@ type Adapter interface {
 	AuthDelScheme(user t.Uid, scheme string) error
 	// AuthDelAllRecords deletes all records of a given user.
 	AuthDelAllRecords(uid t.Uid) (int, error)
+	// AuthDelPhoneTemp deletes unconfirmed (temp) records (for phone scheme only)
+	AuthDelPhoneTemp(phone string)
 	// AuthUpdRecord modifies an authentication record.
 	AuthUpdRecord(user t.Uid, scheme, unique string, authLvl auth.Level, secret []byte, expires time.Time) error
 

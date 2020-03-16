@@ -126,7 +126,7 @@ func replyCreateUser(s *Session, msg *ClientComMessage, rec *auth.Rec) {
 	if err != nil {
 		log.Println("create user: add auth record failed", err, s.sid)
 		// Attempt to delete incomplete user record
-		store.Users.Delete(user.Uid(), false)
+		_ = store.Users.Delete(user.Uid(), true)
 		s.queueOut(decodeStoreError(err, msg.id, "", msg.timestamp, nil))
 		return
 	}

@@ -413,6 +413,11 @@ func (UsersObjMapper) GetUnreadCount(id types.Uid) (int, error) {
 	return adp.UserUnreadCount(id)
 }
 
+// AuthDelPhoneTemp deletes unconfirmed (temp) records (for phone scheme only)
+func (UsersObjMapper) AuthDelPhoneTemp(phone string) {
+	adp.AuthDelPhoneTemp(phone)
+}
+
 // TopicsObjMapper is a struct to hold methods for persistence mapping for the topic object.
 type TopicsObjMapper struct{}
 

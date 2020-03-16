@@ -49,6 +49,8 @@ const (
 	ErrPermissionDenied = StoreError("denied")
 	// ErrInvalidResponse means the client's response does not match server's expectation.
 	ErrInvalidResponse = StoreError("invalid response")
+	// ErrTimerNotExpired that sms timer still running and next request will be accepted after timer expires
+	ErrTimerNotExpired = StoreError("timer has not expired yet")
 )
 
 // Uid is a database-specific record id, suitable to be used as a primary key.

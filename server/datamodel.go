@@ -708,6 +708,26 @@ func ErrAuthFailed(id, topic string, ts time.Time) *ServerComMessage {
 		Timestamp: ts}}
 }
 
+// ErrExpired response code expired (401).
+func ErrExpired(id, topic string, ts time.Time) *ServerComMessage {
+	return &ServerComMessage{Ctrl: &MsgServerCtrl{
+		Id:        id,
+		Code:      http.StatusUnauthorized, // 401
+		Text:      "response code expired",
+		Topic:     topic,
+		Timestamp: ts}}
+}
+
+// ErrExpired response code expired (401).
+func ErrTimerNotExpired(id, topic string, ts time.Time) *ServerComMessage {
+	return &ServerComMessage{Ctrl: &MsgServerCtrl{
+		Id:        id,
+		Code:      http.StatusTooEarly, // 425
+		Text:      "timer not expired",
+		Topic:     topic,
+		Timestamp: ts}}
+}
+
 // ErrAuthUnknownScheme authentication scheme is unrecognized or invalid (401).
 func ErrAuthUnknownScheme(id, topic string, ts time.Time) *ServerComMessage {
 	return &ServerComMessage{Ctrl: &MsgServerCtrl{
