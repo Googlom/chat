@@ -99,7 +99,7 @@ func (a *authenticator) getAuthDetails(phoneNumber string, tempOnly bool) (types
 		return uid, string(needResp), expires, err
 	} else {
 		// get persistent or temp record
-		uid, _, needResp, _, err := store.Users.GetAuthUniqueRecord(a.name, phoneNumber)
+		uid, _, needResp, _, err := store.Users.GetAuthUniqueRecord(a.name+"_any", phoneNumber)
 		return uid, string(needResp), time.Time{}, err
 	}
 }
@@ -244,7 +244,7 @@ func (a *authenticator) IsUnique(secret []byte) (bool, error) {
 		return false, err
 	}
 
-	uid, _, _, _, err := store.Users.GetAuthUniqueRecord(a.name, phoneNumber)
+	uid, _, _, err := a.getAuthDetails(phoneNumber, false)
 	if err != nil {
 		return false, err
 	}
