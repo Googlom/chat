@@ -24,10 +24,18 @@ LABEL version=$VERSION
 # Alternatively use
 # `--build-arg TARGET_DB=mysql` to build for MySQL or
 # `--build-arg TARGET_DB=mongodb` to build for MongoDB.
+# `--build-arg TARGET_DB=alldbs` to build a generic Tinode docker image.
 ARG TARGET_DB=rethinkdb
 ENV TARGET_DB=$TARGET_DB
 
 # Runtime options.
+
+# Specifies what jobs to run: init-db, tinode or both.
+ENV SERVICES_TO_RUN='both'
+
+# Specifies the database host:port pair to wait for before running Tinode.
+# Ignored if empty.
+ENV WAIT_FOR=
 
 # An option to reset database.
 ENV RESET_DB=false
@@ -36,8 +44,8 @@ ENV RESET_DB=false
 ENV UPGRADE_DB=false
 
 # Load sample data to database from data.json.
-ARG DEFAULT_SAMPLE_DATA=data.json
-ENV SAMPLE_DATA=
+ARG SAMPLE_DATA=data.json
+ENV SAMPLE_DATA=$SAMPLE_DATA
 
 # The MySQL DSN connection.
 ENV MYSQL_DSN='root@tcp(mysql)/tinode'
@@ -77,6 +85,18 @@ ENV FCM_PUSH_ENABLED=false
 
 # Enable Android-specific notifications by default.
 ENV FCM_INCLUDE_ANDROID_NOTIFICATION=true
+
+# Disable push notifications via Tinode Push Gateway.
+ENV TNPG_PUSH_ENABLED=false
+
+# Tinode Push Gateway authentication token.
+ENV TNPG_AUTH_TOKEN=
+
+# Tinode Push Gateway user name.
+ENV TNPG_USER=
+
+# Enable Tinode Push Gateway request payload compression.
+ENV TNPG_COMPRESS_PAYLOADS=true
 
 # Use the target db by default.
 # When TARGET_DB is "alldbs", it is the user's responsibility

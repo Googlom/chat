@@ -8,7 +8,7 @@
 	"max_message_size": 4194304,
 	"max_subscriber_count": 32,
 	"max_tag_count": 16,
-	"expvar": "",
+	"expvar": "/stats/expvar/",
 
 	"media": {
 		"use_handler": "$MEDIA_HANDLER",
@@ -106,6 +106,15 @@
 
 	"push": [
 		{
+			"name":"tnpg",
+			"config": {
+				"enabled": $TNPG_PUSH_ENABLED,
+				"auth_token": "$TNPG_AUTH_TOKEN",
+				"user": "$TNPG_USER",
+				"compress_payloads": $TNPG_COMPRESS_PAYLOADS
+			}
+		},
+		{
 			"name":"fcm",
 			"config": {
 				"enabled": $FCM_PUSH_ENABLED,
@@ -132,6 +141,22 @@
 			}
 		}
 	],
+
+	"cluster_config": {
+		"self": "",
+		"nodes": [
+			// Name and TCP address of each node.
+			{"name": "tinode-0", "addr": "tinode-0:12001"},
+			{"name": "tinode-1", "addr": "tinode-1:12002"},
+			{"name": "tinode-2", "addr": "tinode-2:12003"}
+		],
+		"failover": {
+			"enabled": true,
+			"heartbeat": 100,
+			"vote_after": 8,
+			"node_fail_after": 16
+		}
+	},
 
 	"plugins": [
 		{
