@@ -222,6 +222,10 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 		rec.AuthLevel = auth.LevelAuth
 		rec.Features = auth.FeatureValidated
 
+		if a.addToTags {
+			rec.Tags = append(rec.Tags, a.name+":"+phoneNumber)
+		}
+
 		err = a.updateRecord(rec, phoneNumber)
 		store.Users.AuthDelPhoneTemp(phoneNumber)
 
