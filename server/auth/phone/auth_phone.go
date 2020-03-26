@@ -158,6 +158,10 @@ func (a *authenticator) AddRecord(rec *auth.Rec, secret []byte) (*auth.Rec, erro
 		return rec, types.ErrTimerNotExpired
 	}
 
+	if a.addToTags {
+		rec.Tags = append(rec.Tags, a.name+":"+phoneNumber)
+	}
+
 	return a.addRecord(rec, phoneNumber)
 }
 
@@ -221,10 +225,6 @@ func (a *authenticator) Authenticate(secret []byte) (*auth.Rec, []byte, error) {
 		rec.Uid = uid
 		rec.AuthLevel = auth.LevelAuth
 		rec.Features = auth.FeatureValidated
-
-		if a.addToTags {
-			rec.Tags = append(rec.Tags, a.name+":"+phoneNumber)
-		}
 
 		err = a.updateRecord(rec, phoneNumber)
 		store.Users.AuthDelPhoneTemp(phoneNumber)
