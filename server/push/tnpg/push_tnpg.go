@@ -16,22 +16,21 @@ import (
 const (
 	baseTargetAddress = "https://pushgw.tinode.co/push/"
 	batchSize         = 100
+	bufferSize        = 1024
 )
 
 var handler Handler
 
 type Handler struct {
-	input       chan *push.Receipt
-	stop        chan bool
+	input   chan *push.Receipt
+	stop    chan bool
+	postUrl string
 }
 
 type configType struct {
-	Enabled          bool   `json:"enabled"`
-	Buffer           int    `json:"buffer"`
-	CompressPayloads bool   `json:"compress_payloads"`
-	User             string `json:"user"`
-	AuthToken        string `json:"auth_token"`
-	Android          fcm.AndroidConfig `json:"android,omitempty"`
+	Enabled   bool   `json:"enabled"`
+	OrgName   string `json:"org"`
+	AuthToken string `json:"token"`
 }
 
 // Init initializes the handler
@@ -45,11 +44,12 @@ func (Handler) Init(jsonconf string) error {
 		return nil
 	}
 
-	if len(config.User) == 0 {
-		return errors.New("push.tnpg.user not specified.")
+	if config.OrgName == "" {
+		return errors.New("push.tnpg.org not specified.")
 	}
 
-	handler.input = make(chan *push.Receipt, config.Buffer)
+	handler.postUrl = baseTargetAddress + config.OrgName
+	handler.input = make(chan *push.Receipt, bufferSize)
 	handler.stop = make(chan bool, 1)
 
 	go func() {
@@ -68,23 +68,18 @@ func (Handler) Init(jsonconf string) error {
 
 func postMessage(body interface{}, config *configType) (int, string, error) {
 	buf := new(bytes.Buffer)
-	if config.CompressPayloads {
-		gz := gzip.NewWriter(buf)
-		json.NewEncoder(gz).Encode(body)
-		gz.Close()
-	} else {
-		json.NewEncoder(buf).Encode(body)
-	}
-	targetAddress := baseTargetAddress + config.User
-	req, err := http.NewRequest("POST", targetAddress, buf)
+	gz := gzip.NewWriter(buf)
+	json.NewEncoder(gz).Encode(body)
+	gz.Close()
+
+	req, err := http.NewRequest("POST", handler.postUrl, buf)
 	if err != nil {
 		return -1, "", err
 	}
-	req.Header.Add("Authorization", "Bearer " + config.AuthToken)
+	req.Header.Add("Authorization", "Bearer "+config.AuthToken)
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	if config.CompressPayloads {
-		req.Header.Add("Content-Encoding", "gzip")
-	}
+	req.Header.Add("Content-Encoding", "gzip")
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return -1, "", err
@@ -94,7 +89,7 @@ func postMessage(body interface{}, config *configType) (int, string, error) {
 }
 
 func sendPushes(rcpt *push.Receipt, config *configType) {
-	messages := fcm.PrepareNotifications(rcpt, &config.Android)
+	messages := fcm.PrepareNotifications(rcpt, nil)
 	if messages == nil {
 		return
 	}

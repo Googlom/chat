@@ -4,7 +4,7 @@
 # * Tinode server
 # * Tinode exporters
 
-version: '3.4'
+version: '3.7'
 
 # Base Tinode template.
 x-tinode:
@@ -16,7 +16,6 @@ x-tinode:
 
 x-tinode-env-vars: &tinode-env-vars
   "STORE_USE_ADAPTER": "mysql"
-  "DEFAULT_SAMPLE_DATA": ""
   "PPROF_URL": "/pprof"
   # You can provide your own tinode config by setting EXT_CONFIG env var and binding your configuration file to
   # "EXT_CONFIG": "/etc/tinode/tinode.conf"
@@ -42,7 +41,7 @@ x-tinode-env-vars: &tinode-env-vars
   # "IOS_UNIV_LINKS_APP_ID": "<ios universal links app id>"
 
 x-exporter-env-vars: &exporter-env-vars
-  "TINODE_ADDR": "http://tinode.host:18080/stats/expvar/"
+  "TINODE_ADDR": "http://tinode.host:6060/stats/expvar/"
   # InfluxDB configation:
   "SERVE_FOR": "influxdb"
   "INFLUXDB_VERSION": 1.7
@@ -82,12 +81,11 @@ services:
     #   # Logs directory.
     #   - <path to your tinode-0 logs directory>:/var/log
     ports:
-      - "6060:18080"
+      - "6060:6060"
     environment:
       << : *tinode-env-vars
-      # Uncomment the lines below if you wish to upgrade or reset the database.
-      # "UPGRADE_DB": "true"
-      # "RESET_DB": "true"
+      "RESET_DB": ${RESET_DB:-false}
+      "UPGRADE_DB": ${UPGRADE_DB:-false}
 
   # Monitoring.
   # Exporters are paired with tinode instances.
@@ -98,8 +96,10 @@ services:
       - tinode-0
     image: tinode/exporter:latest
     restart: always
+    ports:
+      - "6222:6222"
     links:
       - tinode-0:tinode.host
     environment:
       << : *exporter-env-vars
-      "WAIT_FOR": "tinode-0:18080"
+      "WAIT_FOR": "tinode-0:6060"
