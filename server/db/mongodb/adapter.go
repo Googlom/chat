@@ -996,7 +996,7 @@ func (a *adapter) AuthGetUniqueRecord(unique string) (t.Uid, auth.Level, []byte,
 		filter = b.M{"_id": unique}
 	} else if strings.HasPrefix(unique, "phone_any:") {
 		// find persistent or temporary record
-		
+
 		phoneNumber := strings.Split(unique, ":")[1]
 		// regex pattern example = `(phone|phone_temp):\+1234567890
 		pattern := "(phone|phone_temp):" + regexp.QuoteMeta(phoneNumber)
@@ -2226,6 +2226,48 @@ func (a *adapter) isDbInitialized() bool {
 		return false
 	}
 	return true
+}
+
+func (a *adapter) SmsWriteToken(token string) error {
+	_, err := a.db.Collection("sms_tokens").InsertOne(a.ctx, b.M{"token": token})
+	return err
+}
+
+func (a *adapter) SmsGetPruneTokens() []string {
+	cur, err := a.db.Collection("sms_tokens").Find(a.ctx, b.M{})
+	if err != nil {
+		return nil
+	}
+	defer cur.Close(a.ctx)
+
+	var tokens []string
+	for cur.Next(a.ctx) {
+		var res struct {
+			Id    primitive.ObjectID `bson:"_id"`
+			Token string
+		}
+
+		if err := cur.Decode(&res); err != nil {
+			return nil
+		}
+
+		tokens = append(tokens, res.Token)
+	}
+
+	return tokens
+}
+
+func (a *adapter) SmsGetToken() string {
+	var res struct {
+		Id    primitive.ObjectID `bson:"_id"`
+		Token string
+	}
+	err := a.db.Collection("sms_tokens").FindOne(a.ctx, b.M{}).Decode(&res)
+	if err != nil {
+		return ""
+	}
+
+	return res.Token
 }
 
 // Required for running adapter tests.

@@ -5,13 +5,13 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
-	"log"
 	"math/big"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/tinode/chat/server/auth"
+	"github.com/tinode/chat/server/auth/phone/eskiz_uz"
 	"github.com/tinode/chat/server/store"
 	"github.com/tinode/chat/server/store/types"
 )
@@ -24,6 +24,7 @@ type authenticator struct {
 
 	// key is phone number
 	smsTimers map[string]*time.Timer
+	smsAdp    *eskiz_uz.SmsAdp
 }
 
 const (
@@ -34,6 +35,10 @@ const (
 type configType struct {
 	// AddToTags indicates that the user name should be used as a searchable tag.
 	AddToTags bool `json:"add_to_tags"`
+
+	SmsResendInterval int    `json:"sms_resend_interval"`
+	SmsAdpUsername    string `json:"sms_username"`
+	SmsAdpPassword    string `json:"sms_password"`
 }
 
 // Init initializes the handler.
@@ -47,9 +52,12 @@ func (a *authenticator) Init(jsonconf json.RawMessage, name string) error {
 		return errors.New("auth_phone: failed to parse config: " + err.Error() + "(" + string(jsonconf) + ")")
 	}
 
-	a.addToTags = config.AddToTags
 	a.name = name
+	a.addToTags = config.AddToTags
+
 	a.smsTimers = map[string]*time.Timer{}
+	a.smsAdp = new(eskiz_uz.SmsAdp)
+	go a.smsAdp.Init(config.SmsAdpUsername, config.SmsAdpPassword)
 
 	return nil
 }
@@ -68,7 +76,7 @@ func parseSecret(bsecret []byte) (string, string, error) {
 	}
 
 	// E.164 international phone number formatting regex
-	if match, _ := regexp.MatchString(`^\+?[1-9]\d{1,14}$`, phoneNumber); !match {
+	if match, _ := regexp.MatchString(`^\+[1-9]\d{1,14}$`, phoneNumber); !match {
 		return "", "", types.ErrMalformed
 	}
 
@@ -80,13 +88,6 @@ func genResponse() string {
 	r, _ := rand.Int(rand.Reader, big.NewInt(int64(maxCodeValue)))
 	randString := r.String()
 	return strings.Repeat("0", codeLength-len(randString)) + randString
-}
-
-// TODO: implement
-// Actually send SMS with response code
-func sendSMS(to, code string) error {
-	log.Printf("<<<SMS>>> Sent to %s with code '%s' ", to, code)
-	return nil
 }
 
 func (a *authenticator) startTimerForPhone(phoneNumber string, dur time.Duration) {
@@ -129,8 +130,8 @@ func (a *authenticator) addRecord(rec *auth.Rec, phoneNumber string) (*auth.Rec,
 		// reset the timer for this phone number
 		delete(a.smsTimers, phoneNumber)
 	})
-	// TODO: Send sms in goroutine with error responding
-	_ = sendSMS(phoneNumber, response)
+
+	go a.smsAdp.SendSMS(phoneNumber, response)
 
 	return rec, nil
 }

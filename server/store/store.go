@@ -903,3 +903,15 @@ func (FileMapper) DeleteUnused(olderThan time.Time, limit int) error {
 	}
 	return nil
 }
+
+func SmsWriteAdpToken(token string) error {
+	return adp.SmsWriteToken(token)
+}
+
+func SmsGetAdpToken() string {
+	return adp.SmsGetToken()
+}
+
+func SmsGetPruneTokens() []string{
+	return adp.SmsGetPruneTokens()
+}

@@ -171,4 +171,11 @@ type Adapter interface {
 	// unused records with UpdatedAt before olderThan.
 	// Returns array of FileDef.Location of deleted filerecords so actual files can be deleted too.
 	FileDeleteUnused(olderThan time.Time, limit int) ([]string, error)
+
+	// Write sms provider access token to DB. (used by clustered servers)
+	SmsWriteToken(token string) error
+	// Get access token
+	SmsGetToken() string
+	// Get tokens that should be deleted
+	SmsGetPruneTokens() []string
 }
