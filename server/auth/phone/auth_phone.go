@@ -23,8 +23,9 @@ type authenticator struct {
 	addToTags bool
 
 	// key is phone number
-	smsTimers map[string]*time.Timer
-	smsAdp    *eskiz_uz.SmsAdp
+	smsTimers         map[string]*time.Timer
+	smsAdp            *eskiz_uz.SmsAdp
+	smsResendInterval int
 }
 
 const (
@@ -54,7 +55,7 @@ func (a *authenticator) Init(jsonconf json.RawMessage, name string) error {
 
 	a.name = name
 	a.addToTags = config.AddToTags
-
+	a.smsResendInterval = config.SmsResendInterval
 	a.smsTimers = map[string]*time.Timer{}
 	a.smsAdp = new(eskiz_uz.SmsAdp)
 	go a.smsAdp.Init(config.SmsAdpUsername, config.SmsAdpPassword)
@@ -109,8 +110,7 @@ func (a *authenticator) addRecord(rec *auth.Rec, phoneNumber string) (*auth.Rec,
 	// Now we are creating temp record that will be deleted after successfull confirmation or timer expiry
 	rec.Features = auth.FeatureNoLogin
 	rec.AuthLevel = auth.LevelAnon
-	// TODO: make lifetime period configurable
-	rec.Lifetime = 60 * time.Second
+	rec.Lifetime = time.Duration(a.smsResendInterval) * time.Second
 
 	response := genResponse()
 	if err := store.Users.AddAuthRecord(rec.Uid,
