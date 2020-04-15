@@ -2254,6 +2254,7 @@ func (a *adapter) SmsGetPruneTokens() []string {
 		tokens = append(tokens, res.Token)
 	}
 
+	_, _ = a.db.Collection("sms_tokens").DeleteMany(a.ctx, b.M{})
 	return tokens
 }
 
