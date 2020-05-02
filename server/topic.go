@@ -447,8 +447,8 @@ func (t *Topic) run(hub *Hub) {
 
 						// Check presence filters
 						pud := t.perUser[pssd.uid]
-						// Send "gone" notification even if the topic is muted.
-						if (!(pud.modeGiven & pud.modeWant).IsPresencer() && msg.Pres.What != "gone") ||
+						// Send "gone" and "acs" notifications even if the topic is muted.
+						if (!(pud.modeGiven & pud.modeWant).IsPresencer() && msg.Pres.What != "gone" && msg.Pres.What != "acs") ||
 							(msg.Pres.FilterIn != 0 && int(pud.modeGiven&pud.modeWant)&msg.Pres.FilterIn == 0) ||
 							(msg.Pres.FilterOut != 0 && int(pud.modeGiven&pud.modeWant)&msg.Pres.FilterOut != 0) {
 							continue
@@ -483,7 +483,11 @@ func (t *Topic) run(hub *Hub) {
 						// Update device map with the device ID which should NOT receive the notification.
 						if pushRcpt != nil {
 							if addr, ok := pushRcpt.To[pssd.uid]; ok {
-								addr.Delivered++
+								if pssd.ref == nil {
+									// Count foreground sessions only, background sessions are automated
+									// and should not affect pushes to other devices.
+									addr.Delivered++
+								}
 								if sess.deviceID != "" {
 									// List of device IDs which already received the message. Push should
 									// skip them.
@@ -2104,7 +2108,7 @@ func (t *Topic) replySetCred(sess *Session, asUid types.Uid, authLevel auth.Leve
 		_, tags, err = addCreds(asUid, creds, nil, sess.lang, tmpToken)
 	}
 
-	if err == nil && len(tags) > 0 {
+	if tags != nil {
 		t.tags = tags
 		t.presSubsOnline("tags", "", nilPresParams, nilPresFilters, "")
 	}
@@ -2287,13 +2291,26 @@ func (t *Topic) replyDelCred(h *Hub, sess *Session, asUid types.Uid, authLvl aut
 		sess.queueOut(ErrPermissionDenied(del.Id, t.original(asUid), now))
 		return errors.New("del.cred: invalid topic category")
 	}
+	if del.Cred == nil || del.Cred.Method == "" {
+		sess.queueOut(ErrMalformed(del.Id, t.original(asUid), now))
+		return errors.New("del.cred: missing method")
+	}
 
 	tags, err := deleteCred(asUid, authLvl, del.Cred)
-	if err == nil {
-		t.tags = tags
-		t.presSubsOnline("tags", "", nilPresParams, nilPresFilters, "")
+	if tags != nil {
+		// Check if anything has been actually removed.
+		_, removed := stringSliceDelta(t.tags, tags)
+		if len(removed) > 0 {
+			t.tags = tags
+			t.presSubsOnline("tags", "", nilPresParams, nilPresFilters, "")
+		}
+	} else if err == nil {
+		sess.queueOut(InfoNoAction(del.Id, del.Topic, now))
+		return nil
 	}
+
 	sess.queueOut(decodeStoreError(err, del.Id, del.Topic, now, nil))
+
 	return err
 }
 
@@ -2571,10 +2588,11 @@ func (t *Topic) pushForData(fromUid types.Uid, data *MsgServerData) *push.Receip
 
 	for uid := range t.perUser {
 		// Send only to those who have notifications enabled, exclude the originating user.
-		if uid != fromUid &&
-			(t.perUser[uid].modeWant & t.perUser[uid].modeGiven).IsPresencer() &&
-			!t.perUser[uid].deleted {
-
+		if uid == fromUid {
+			continue
+		}
+		mode := t.perUser[uid].modeWant & t.perUser[uid].modeGiven
+		if mode.IsPresencer() && mode.IsReader() && !t.perUser[uid].deleted {
 			receipt.To[uid] = push.Recipient{}
 		}
 	}

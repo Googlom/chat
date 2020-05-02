@@ -14,10 +14,10 @@ import (
 	t "github.com/tinode/chat/server/store/types"
 )
 
-// Configuration of AndroidNotification payload.
+// AndroidConfig is the configuration of AndroidNotification payload.
 type AndroidConfig struct {
 	Enabled bool `json:"enabled,omitempty"`
-	// Common defauls for all push types.
+	// Common defaults for all push types.
 	androidPayload
 	// Configs for specific push types.
 	Msg androidPayload `json:"msg,omitempty"`
@@ -113,7 +113,8 @@ type androidPayload struct {
 	ClickAction string `json:"click_action,omitempty"`
 }
 
-type messageData struct {
+// MessageData adds user ID and device token to push message. This is needed for error handling.
+type MessageData struct {
 	Uid      t.Uid
 	DeviceId string
 	Message  *fcm.Message
@@ -121,9 +122,8 @@ type messageData struct {
 
 func payloadToData(pl *push.Payload) (map[string]string, error) {
 	if pl == nil {
-		return nil, nil
+		return nil, errors.New("empty push payload")
 	}
-
 	data := make(map[string]string)
 	var err error
 	data["what"] = pl.What
@@ -159,26 +159,34 @@ func payloadToData(pl *push.Payload) (map[string]string, error) {
 	return data, nil
 }
 
+func clonePayload(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for key, val := range src {
+		dst[key] = val
+	}
+	return dst
+}
+
 // PrepareNotifications creates notification payloads ready to be posted
 // to push notification server for the provided receipt.
-func PrepareNotifications(rcpt *push.Receipt, config *AndroidConfig) []messageData {
-	data, _ := payloadToData(&rcpt.Payload)
-	if data == nil {
-		log.Println("fcm push: could not parse payload")
+func PrepareNotifications(rcpt *push.Receipt, config *AndroidConfig) []MessageData {
+	data, err := payloadToData(&rcpt.Payload)
+	if err != nil {
+		log.Println("fcm push: could not parse payload;", err)
 		return nil
 	}
 
 	// List of UIDs for querying the database
 	uids := make([]t.Uid, len(rcpt.To))
-	skipDevices := make(map[string]bool)
+	// These devices were online in the topic when the message was sent.
+	skipDevices := make(map[string]struct{})
 	i := 0
 	for uid, to := range rcpt.To {
 		uids[i] = uid
 		i++
-
 		// Some devices were online and received the message. Skip them.
 		for _, deviceID := range to.Devices {
-			skipDevices[deviceID] = true
+			skipDevices[deviceID] = struct{}{}
 		}
 	}
 
@@ -204,14 +212,20 @@ func PrepareNotifications(rcpt *push.Receipt, config *AndroidConfig) []messageDa
 		color = config.getIconColor(rcpt.Payload.What)
 	}
 
-	var messages []messageData
+	var messages []MessageData
 	for uid, devList := range devices {
+		userData := data
+		if rcpt.To[uid].Delivered > 0 {
+			// Silence the push for user who have received the data interactively.
+			userData = clonePayload(data)
+			userData["silent"] = "true"
+		}
 		for i := range devList {
 			d := &devList[i]
 			if _, ok := skipDevices[d.DeviceId]; !ok && d.DeviceId != "" {
 				msg := fcm.Message{
 					Token: d.DeviceId,
-					Data:  data,
+					Data:  userData,
 				}
 
 				if d.Platform == "android" {
@@ -240,7 +254,7 @@ func PrepareNotifications(rcpt *push.Receipt, config *AndroidConfig) []messageDa
 					// Need to duplicate these in APNS.Payload.Aps.Alert so
 					// iOS may call NotificationServiceExtension (if present).
 					title := "New message"
-					body := data["content"]
+					body := userData["content"]
 					msg.APNS = &fcm.APNSConfig{
 						Payload: &fcm.APNSPayload{
 							Aps: &fcm.Aps{
@@ -260,7 +274,7 @@ func PrepareNotifications(rcpt *push.Receipt, config *AndroidConfig) []messageDa
 						Body:  body,
 					}
 				}
-				messages = append(messages, messageData{Uid: uid, DeviceId: d.DeviceId, Message: &msg})
+				messages = append(messages, MessageData{Uid: uid, DeviceId: d.DeviceId, Message: &msg})
 			}
 		}
 	}
