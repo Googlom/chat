@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"log"
 	"math/big"
 	"regexp"
 	"strings"
@@ -26,6 +27,8 @@ type authenticator struct {
 	smsTimers         map[string]*time.Timer
 	smsAdp            *eskiz_uz.SmsAdp
 	smsResendInterval int
+	// Flag for testing and debugging
+	smsDisabled       bool
 }
 
 const (
@@ -40,6 +43,7 @@ type configType struct {
 	SmsResendInterval int    `json:"sms_resend_interval"`
 	SmsAdpUsername    string `json:"sms_username"`
 	SmsAdpPassword    string `json:"sms_password"`
+	SmsDisabled       bool   `json:"sms_disabled"`
 }
 
 // Init initializes the handler.
@@ -58,6 +62,7 @@ func (a *authenticator) Init(jsonconf json.RawMessage, name string) error {
 	a.smsResendInterval = config.SmsResendInterval
 	a.smsTimers = map[string]*time.Timer{}
 	a.smsAdp = new(eskiz_uz.SmsAdp)
+	a.smsDisabled = config.SmsDisabled
 	go a.smsAdp.Init(config.SmsAdpUsername, config.SmsAdpPassword)
 
 	return nil
@@ -131,7 +136,12 @@ func (a *authenticator) addRecord(rec *auth.Rec, phoneNumber string) (*auth.Rec,
 		delete(a.smsTimers, phoneNumber)
 	})
 
-	go a.smsAdp.SendSMS(phoneNumber, response)
+	if a.smsDisabled {
+		// For testing and debugging
+		log.Printf("SMS sent to %s. Code: %s", phoneNumber, response)
+	} else {
+		go a.smsAdp.SendSMS(phoneNumber, response)
+	}
 
 	return rec, nil
 }
