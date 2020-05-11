@@ -120,7 +120,7 @@ type MessageData struct {
 	Message  *fcm.Message
 }
 
-func payloadToData(pl *push.Payload, clickAction string) (map[string]string, error) {
+func payloadToData(pl *push.Payload) (map[string]string, error) {
 	if pl == nil {
 		return nil, errors.New("empty push payload")
 	}
@@ -156,7 +156,6 @@ func payloadToData(pl *push.Payload, clickAction string) (map[string]string, err
 	} else {
 		return nil, errors.New("unknown push type")
 	}
-	data["click_action"] = clickAction
 	return data, nil
 }
 
@@ -171,8 +170,7 @@ func clonePayload(src map[string]string) map[string]string {
 // PrepareNotifications creates notification payloads ready to be posted
 // to push notification server for the provided receipt.
 func PrepareNotifications(rcpt *push.Receipt, config *AndroidConfig) []MessageData {
-	// ClickAction is custom for flutter support
-	data, err := payloadToData(&rcpt.Payload, config.ClickAction)
+	data, err := payloadToData(&rcpt.Payload)
 	if err != nil {
 		log.Println("fcm push: could not parse payload;", err)
 		return nil
