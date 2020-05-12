@@ -8,6 +8,7 @@
 		- [WebSocket](#websocket)
 		- [Long Polling](#long-polling)
 		- [Out of Band Large Files](#out-of-band-large-files)
+		- [Running Behind a Reverse Proxy](#running-behind-a-reverse-proxy)
 	- [Users](#users)
 		- [Authentication](#authentication)
 			- [Creating an Account](#creating-an-account)
@@ -124,6 +125,8 @@ Once the connection is opened, the client must issue a `{hi}` message to the ser
 
 See definition of the gRPC API in the [proto file](../pbx/model.proto). gRPC API has slightly more functionality than the API described in this document: it allows the `root` user to send messages on behalf of other users as well as delete users.
 
+The `bytes` fields in protobuf messages expect JSON-encoded UTF-8 content. For example, a string should be quoted before being converted to bytes as UTF-8: `[]byte("\"some string\"")` (Go), `'"another string"'.encode('utf-8')` (Python 3).
+
 ### WebSocket
 
 Messages are sent in text frames, one message per frame. Binary frames are reserved for future use. By default server allows connections with any value in the `Origin` header.
@@ -137,6 +140,10 @@ Server allows connections from all origins, i.e. `Access-Control-Allow-Origin: *
 ### Out of Band Large Files
 
 Large files are sent out of band using `HTTP POST` as `Content-Type: multipart/form-data`. See [below](#out-of-band-handling-of-large-files) for details.
+
+### Running Behind a Reverse Proxy
+
+Tinode server can be set up to run behind a reverse proxy, such as NGINX. For efficiency it can accept client connections from Unix sockets by setting `listen` and/or `grpc_listen` config parameters to the path of the Unix socket file, e.g. `unix:/run/tinode.sock`. The server may also be configured to read peer's IP address from `X-Forwarded-For` HTTP header by setting `use_x_forwarded_for` config parameter to `true`.
 
 ## Users
 
@@ -860,7 +867,7 @@ The unique message ID should be formed as `<topic_name>:<seqId>` whenever possib
 
 #### `{get}`
 
-Query topic for metadata, such as description or a list of subscribers, or query message history.
+Query topic for metadata, such as description or a list of subscribers, or query message history. The requester must be [subscribed and attached](#sub) to the topic to receive the full response. Some limited `desc` and `sub` information is available without being attached.
 
 ```js
 get: {
@@ -915,6 +922,8 @@ get: {
 Query topic description. Server responds with a `{meta}` message containing requested data. See `{meta}` for details.
 If `ims` is specified and data has not been updated, the message will skip `public` and `private` fields.
 
+Limited information is available without [attaching](#sub) to topic first.
+
 See [Public and Private Fields](#public-and-private-fields) for `private` and `public` format considerations.
 
 * `{get what="sub"}`
@@ -922,6 +931,8 @@ See [Public and Private Fields](#public-and-private-fields) for `private` and `p
 Get a list of subscribers. Server responds with a `{meta}` message containing a list of subscribers. See `{meta}` for details.
 For `me` topic the request returns a list of user's subscriptions. If `ims` is specified and data has not been updated,
 responds with a `{ctrl}` "not modified" message.
+
+Only user's own subscription is returned without [attaching](#sub) to topic first.
 
 * `{get what="tags"}`
 
@@ -943,7 +954,7 @@ Query [credentials](#credentail-validation). Server responds with a `{meta}` mes
 
 #### `{set}`
 
-Update topic metadata, delete messages or topic.
+Update topic metadata, delete messages or topic. The requester is generally expected to be [subscribed and attached](#sub) to the topic. Only `desc.private` and requester's `sub.mode` can be updated without attaching first.
 
 ```js
 set: {
@@ -1112,7 +1123,7 @@ ctrl: {
 
 #### `{meta}`
 
-Information about topic metadata or subscribers, sent in response to `{set}` or `{sub}` message to the originating session.
+Information about topic metadata or subscribers, sent in response to `{get}`, `{set}` or `{sub}` message to the originating session.
 
 ```js
 meta: {
@@ -1163,12 +1174,13 @@ meta: {
         mode: "JRWP" // string, combination of want and given
       },
       read: 112, // integer, ID of the message user claims through {note} message
-                 // to have read, optional
-      recv: 315, // integer, like 'read', but received, optional
+                 // to have read, optional.
+      recv: 315, // integer, like 'read', but received, optional.
       clear: 12, // integer, in case some messages were deleted, the greatest ID
-                 // of a deleted message, optional
-      private: { ... } // application-defined user's 'private' object, present only
-                       // for the requester's own subscriptions.
+                 // of a deleted message, optional.
+      public: { ... }, // application-defined user's 'public' object, absent when
+                       // querying P2P topics.
+      private: { ... } // application-defined user's 'private' object.
       online: true, // boolean, current online status of the user; if this is a
                     // group or a p2p topic, it's user's online status in the topic,
                     // i.e. if the user is attached and listening to messages; if this
@@ -1183,11 +1195,8 @@ meta: {
       topic: "grp1XUtEhjv6HND", // string, topic this subscription describes
       seq: 321, // integer, server-issued id of the last {data} message
 
-      // The following fields are present only when querying 'me' topic and the
+      // The following field is present only when querying 'me' topic and the
       // topic described is a P2P topic
-
-      public: { ... }, // application-defined user's 'public' object, present for
-                      // P2P topics only
       seen: { // object, if this is a P2P topic, info on when the peer was last
               //online
         when: "2015-10-24T10:26:09.716Z", // timestamp

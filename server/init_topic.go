@@ -266,7 +266,7 @@ func initTopicP2P(t *Topic, sreg *sessionJoin) error {
 
 		// Fetching records for both users.
 		// Requester.
-		userID1 := types.ParseUserId(sreg.pkt.from)
+		userID1 := types.ParseUserId(sreg.pkt.asUser)
 		// The other user.
 		userID2 := types.ParseUserId(t.xoriginal)
 		// User index: u1 - requester, u2 - responder, the other user
@@ -428,7 +428,7 @@ func initTopicP2P(t *Topic, sreg *sessionJoin) error {
 			}
 		}
 
-		// Publics is already swapped
+		// Publics are already swapped.
 		userData.public = sub1.GetPublic()
 		userData.topicName = userID2.UserId()
 		userData.modeWant = sub1.ModeWant
@@ -463,7 +463,7 @@ func initTopicNewGrp(t *Topic, sreg *sessionJoin) error {
 	t.cat = types.TopicCatGrp
 
 	// Generic topics have parameters stored in the topic object
-	t.owner = types.ParseUserId(sreg.pkt.from)
+	t.owner = types.ParseUserId(sreg.pkt.asUser)
 
 	t.accessAuth = getDefaultAccess(t.cat, true)
 	t.accessAnon = getDefaultAccess(t.cat, false)

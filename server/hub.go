@@ -229,20 +229,14 @@ func (h *Hub) run() {
 				go h.topicsStateForUser(meta.forUser, meta.state == types.StateSuspended)
 			} else {
 				// Metadata read or update from a user who is not attached to the topic.
-				if dst := h.topicGet(meta.topic); dst != nil {
-					// If topic is already in memory, pass request to the topic.
-					dst.meta <- meta
-				} else {
-					// Topic is not in memory. Read or update the DB record and reply here.
-					if meta.pkt.Get != nil {
-						if meta.what == constMsgMetaDesc {
-							go replyOfflineTopicGetDesc(meta.sess, meta.topic, meta.pkt)
-						} else {
-							go replyOfflineTopicGetSub(meta.sess, meta.topic, meta.pkt)
-						}
-					} else if meta.pkt.Set != nil {
-						go replyOfflineTopicSetSub(meta.sess, meta.topic, meta.pkt)
+				if meta.pkt.Get != nil {
+					if meta.what == constMsgMetaDesc {
+						go replyOfflineTopicGetDesc(meta.sess, meta.topic, meta.pkt)
+					} else {
+						go replyOfflineTopicGetSub(meta.sess, meta.topic, meta.pkt)
 					}
+				} else if meta.pkt.Set != nil {
+					go replyOfflineTopicSetSub(meta.sess, meta.topic, meta.pkt)
 				}
 			}
 
@@ -357,7 +351,7 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 	now := time.Now().UTC().Round(time.Millisecond)
 
 	if reason == StopDeleted {
-		asUid := types.ParseUserId(msg.from)
+		asUid := types.ParseUserId(msg.asUser)
 		// Case 1 (unregister and delete)
 		if t := h.topicGet(topic); t != nil {
 			// Case 1.1: topic is online
@@ -389,7 +383,7 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 		} else {
 			// Case 1.2: topic is offline.
 
-			asUid := types.ParseUserId(msg.from)
+			asUid := types.ParseUserId(msg.asUser)
 			// Get all subscribers: we need to know how many are left and notify them.
 			subs, err := store.Topics.GetSubs(topic, nil)
 			if err != nil {
@@ -535,7 +529,7 @@ func (h *Hub) stopTopicsForUser(uid types.Uid, reason int, alldone chan<- bool) 
 func replyOfflineTopicGetDesc(sess *Session, topic string, msg *ClientComMessage) {
 	now := types.TimeNow()
 	desc := &MsgTopicDesc{}
-	asUid := types.ParseUserId(msg.from)
+	asUid := types.ParseUserId(msg.asUser)
 
 	if strings.HasPrefix(topic, "grp") {
 		stopic, err := store.Topics.Get(topic)
@@ -552,7 +546,7 @@ func replyOfflineTopicGetDesc(sess *Session, topic string, msg *ClientComMessage
 		desc.CreatedAt = &stopic.CreatedAt
 		desc.UpdatedAt = &stopic.UpdatedAt
 		desc.Public = stopic.Public
-		if stopic.Owner == msg.from {
+		if stopic.Owner == msg.asUser {
 			desc.DefaultAcs = &MsgDefaultAcsMode{
 				Auth: stopic.Access.Auth.String(),
 				Anon: stopic.Access.Anon.String()}
@@ -624,12 +618,12 @@ func replyOfflineTopicGetDesc(sess *Session, topic string, msg *ClientComMessage
 func replyOfflineTopicGetSub(sess *Session, topic string, msg *ClientComMessage) {
 	now := types.TimeNow()
 
-	if msg.Get.Sub != nil && msg.Get.Sub.User != "" && msg.Get.Sub.User != msg.from {
+	if msg.Get.Sub != nil && msg.Get.Sub.User != "" && msg.Get.Sub.User != msg.asUser {
 		sess.queueOut(ErrPermissionDenied(msg.id, msg.topic, now))
 		return
 	}
 
-	ssub, err := store.Subs.Get(topic, types.ParseUserId(msg.from))
+	ssub, err := store.Subs.Get(topic, types.ParseUserId(msg.asUser))
 	if err != nil {
 		log.Println("replyOfflineTopicGetSub:", err)
 		sess.queueOut(decodeStoreError(err, msg.id, msg.topic, now, nil))
@@ -648,8 +642,11 @@ func replyOfflineTopicGetSub(sess *Session, topic string, msg *ClientComMessage)
 			Want:  ssub.ModeWant.String(),
 			Given: ssub.ModeGiven.String(),
 			Mode:  (ssub.ModeGiven & ssub.ModeWant).String()}
-		sub.Private = ssub.Private
-		sub.User = ssub.User
+		// Fnd is asymmetric: desc.private is a string, but sub.private is a []string.
+		if types.GetTopicCat(topic) != types.TopicCatFnd {
+			sub.Private = ssub.Private
+		}
+		sub.User = types.ParseUid(ssub.User).UserId()
 
 		if (ssub.ModeGiven & ssub.ModeWant).IsReader() && (ssub.ModeWant & ssub.ModeGiven).IsJoiner() {
 			sub.DelId = ssub.DelId
@@ -673,12 +670,12 @@ func replyOfflineTopicSetSub(sess *Session, topic string, msg *ClientComMessage)
 		return
 	}
 
-	if msg.Set.Sub != nil && msg.Set.Sub.User != "" && msg.Set.Sub.User != msg.from {
+	if msg.Set.Sub != nil && msg.Set.Sub.User != "" && msg.Set.Sub.User != msg.asUser {
 		sess.queueOut(ErrPermissionDenied(msg.id, msg.topic, now))
 		return
 	}
 
-	asUid := types.ParseUserId(msg.from)
+	asUid := types.ParseUserId(msg.asUser)
 
 	sub, err := store.Subs.Get(topic, asUid)
 	if err != nil {

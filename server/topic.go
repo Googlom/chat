@@ -190,7 +190,7 @@ func (t *Topic) run(hub *Hub) {
 			// Request to add a connection to this topic
 
 			if t.isInactive() {
-				asUid := types.ParseUserId(sreg.pkt.from)
+				asUid := types.ParseUserId(sreg.pkt.asUser)
 				sreg.sess.queueOut(ErrLocked(sreg.pkt.id, t.original(asUid), types.TimeNow()))
 			} else {
 				// The topic is alive, so stop the kill timer, if it's ticking. We don't want the topic to die
@@ -252,7 +252,7 @@ func (t *Topic) run(hub *Hub) {
 						}
 					}
 					// Update user's last online timestamp & user agent
-					if err := store.Users.UpdateLastSeen(asUid, mrs.userAgent, now); err != nil {
+					if err := store.Users.UpdateLastSeen(pssd.uid, mrs.userAgent, now); err != nil {
 						log.Println(err)
 					}
 				case types.TopicCatFnd:
@@ -261,7 +261,7 @@ func (t *Topic) run(hub *Hub) {
 				case types.TopicCatGrp:
 					if pud.online == 0 {
 						// User is going offline: notify online subscribers on 'me'
-						t.presSubsOnline("off", asUid.UserId(), nilPresParams,
+						t.presSubsOnline("off", pssd.uid.UserId(), nilPresParams,
 							&presFilters{filterIn: types.ModeRead}, "")
 					}
 				}
@@ -282,7 +282,7 @@ func (t *Topic) run(hub *Hub) {
 			// Content message intended for broadcasting to recipients
 
 			var pushRcpt *push.Receipt
-			asUid := types.ParseUserId(msg.from)
+			asUid := types.ParseUserId(msg.asUser)
 			if msg.Data != nil {
 				if t.isInactive() {
 					msg.sess.queueOut(ErrLocked(msg.id, t.original(asUid), msg.timestamp))
@@ -293,8 +293,8 @@ func (t *Topic) run(hub *Hub) {
 					continue
 				}
 
-				from := types.ParseUserId(msg.Data.From)
-				userData, userFound := t.perUser[from]
+				asUser := types.ParseUserId(msg.Data.From)
+				userData, userFound := t.perUser[asUser]
 				// Anyone is allowed to post to 'sys' topic.
 				if t.cat != types.TopicCatSys {
 					// If it's not 'sys' check write permission.
@@ -309,7 +309,7 @@ func (t *Topic) run(hub *Hub) {
 					ObjHeader: types.ObjHeader{CreatedAt: msg.Data.Timestamp},
 					SeqId:     t.lastID + 1,
 					Topic:     t.name,
-					From:      from.String(),
+					From:      asUser.String(),
 					Head:      msg.Data.Head,
 					Content:   msg.Data.Content}, (userData.modeGiven & userData.modeWant).IsReader()); err != nil {
 
@@ -325,7 +325,7 @@ func (t *Topic) run(hub *Hub) {
 				if userFound {
 					userData.readID = t.lastID
 					userData.readID = t.lastID
-					t.perUser[from] = userData
+					t.perUser[asUser] = userData
 				}
 				if msg.id != "" {
 					reply := NoErrAccepted(msg.id, t.original(asUid), msg.timestamp)
@@ -333,11 +333,11 @@ func (t *Topic) run(hub *Hub) {
 					msg.sess.queueOut(reply)
 				}
 
-				pushRcpt = t.pushForData(from, msg.Data)
+				pushRcpt = t.pushForData(asUser, msg.Data)
 
 				// Message sent: notify offline 'R' subscrbers on 'me'
 				t.presSubsOffline("msg", &presParams{seqID: t.lastID, actor: msg.Data.From},
-					&presFilters{filterIn: types.ModeRead}, "", true)
+					&presFilters{filterIn: types.ModeRead}, nilPresFilters, "", true)
 
 				// Tell the plugins that a message was accepted for delivery
 				pluginMessage(msg.Data, plgActCreate)
@@ -367,8 +367,8 @@ func (t *Topic) run(hub *Hub) {
 					continue
 				}
 
-				from := types.ParseUserId(msg.Info.From)
-				pud := t.perUser[from]
+				asUser := types.ParseUserId(msg.Info.From)
+				pud := t.perUser[asUser]
 
 				// Filter out "kp" from users with no 'W' permission (or people without a subscription)
 				if msg.Info.What == "kp" && (!(pud.modeGiven & pud.modeWant).IsWriter() || t.isReadOnly()) {
@@ -406,7 +406,7 @@ func (t *Topic) run(hub *Hub) {
 						recv = pud.recvID
 					}
 
-					if err := store.Subs.Update(t.name, from,
+					if err := store.Subs.Update(t.name, asUser,
 						map[string]interface{}{
 							"RecvSeqId": pud.recvID,
 							"ReadSeqId": pud.readID},
@@ -417,12 +417,12 @@ func (t *Topic) run(hub *Hub) {
 					}
 
 					// Read/recv updated: notify user's other sessions of the change
-					t.presPubMessageCount(from, recv, read, msg.skipSid)
+					t.presPubMessageCount(asUser, recv, read, msg.skipSid)
 
 					// Update cached count of unread messages
-					usersUpdateUnread(from, unread, true)
+					usersUpdateUnread(asUser, unread, true)
 
-					t.perUser[from] = pud
+					t.perUser[asUser] = pud
 				}
 			}
 
@@ -440,8 +440,12 @@ func (t *Topic) run(hub *Hub) {
 							continue
 						}
 
-						// Notification addressed to a single user only
+						// Notification addressed to a single user only.
 						if msg.Pres.SingleUser != "" && pssd.uid.UserId() != msg.Pres.SingleUser {
+							continue
+						}
+						// Notification should skip a single user.
+						if msg.Pres.ExcludeUser != "" && pssd.uid.UserId() == msg.Pres.ExcludeUser {
 							continue
 						}
 
@@ -516,7 +520,7 @@ func (t *Topic) run(hub *Hub) {
 
 		case meta := <-t.meta:
 			// Request to get/set topic metadata
-			asUid := types.ParseUserId(meta.pkt.from)
+			asUid := types.ParseUserId(meta.pkt.asUser)
 			authLevel := auth.Level(meta.pkt.authLvl)
 			switch {
 			case meta.pkt.Get != nil:
@@ -625,7 +629,7 @@ func (t *Topic) run(hub *Hub) {
 					pssd.ref = nil
 					t.sessions[sreg.sess] = pssd
 				}
-				t.sendSubNotifications(types.ParseUserId(sreg.pkt.from), sreg)
+				t.sendSubNotifications(types.ParseUserId(sreg.pkt.asUser), sreg)
 			}
 
 		case <-uaTimer.C:
@@ -644,7 +648,7 @@ func (t *Topic) run(hub *Hub) {
 				uaTimer.Stop()
 				t.presUsersOfInterest("off", currentUA)
 			} else if t.cat == types.TopicCatGrp {
-				t.presSubsOffline("off", nilPresParams, nilPresFilters, "", false)
+				t.presSubsOffline("off", nilPresParams, nilPresFilters, nilPresFilters, "", false)
 			}
 
 		case sd := <-t.exit:
@@ -656,7 +660,7 @@ func (t *Topic) run(hub *Hub) {
 
 			if sd.reason == StopDeleted {
 				if t.cat == types.TopicCatGrp {
-					t.presSubsOffline("gone", nilPresParams, nilPresFilters, "", false)
+					t.presSubsOffline("gone", nilPresParams, nilPresFilters, nilPresFilters, "", false)
 				}
 				// P2P users get "off+remove" earlier in the process
 
@@ -666,7 +670,7 @@ func (t *Topic) run(hub *Hub) {
 			} else if sd.reason == StopRehashing {
 				// Must send individual messages to sessions because normal sending through the topic's
 				// broadcast channel won't work - it will be shut down too soon.
-				t.presSubsOnlineDirect("term")
+				t.presSubsOnlineDirect("term", nilPresParams, nilPresFilters, "")
 			}
 			// In case of a system shutdown don't bother with notifications. They won't be delivered anyway.
 
@@ -688,7 +692,7 @@ func (t *Topic) run(hub *Hub) {
 
 // Session subscribed to a topic, created == true if topic was just created and {pres} needs to be announced
 func (t *Topic) handleSubscription(h *Hub, sreg *sessionJoin) error {
-	asUid := types.ParseUserId(sreg.pkt.from)
+	asUid := types.ParseUserId(sreg.pkt.asUser)
 	authLevel := auth.Level(sreg.pkt.authLvl)
 
 	msgsub := sreg.pkt.Sub
@@ -762,6 +766,7 @@ func (t *Topic) handleSubscription(h *Hub, sreg *sessionJoin) error {
 }
 
 // Send immediate presence notification in response to a subscription.
+// Send push notification to the P2P counterpart.
 // These notifications are always sent immediately even if background is requested.
 func (t *Topic) sendImmediateSubNotifications(asUid types.Uid, sreg *sessionJoin) {
 	pud := t.perUser[asUid]
@@ -792,6 +797,11 @@ func (t *Topic) sendImmediateSubNotifications(asUid types.Uid, sreg *sessionJoin
 				status += "+en"
 			}
 			t.presSingleUserOffline(uid2, status, nilPresParams, "", false)
+
+			// Also send a push notification to the other user.
+			if pushRcpt := t.pushForSub(asUid, uid2, pud2.modeWant, pud2.modeGiven, types.TimeNow()); pushRcpt != nil {
+				usersPush(pushRcpt)
+			}
 		}
 	}
 
@@ -833,7 +843,7 @@ func (t *Topic) sendSubNotifications(asUid types.Uid, sreg *sessionJoin) {
 			}
 
 			// Notify topic subscribers that the topic is online now.
-			t.presSubsOffline(status, nilPresParams, nilPresFilters, "", false)
+			t.presSubsOffline(status, nilPresParams, nilPresFilters, nilPresFilters, "", false)
 		} else if pud.online == 1 {
 			// If this is the first session of the user in the topic.
 			// Notify other online group members that the user is online now.
@@ -855,14 +865,14 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
 	}
 
 	msgsub := sreg.pkt.Sub
-	asUid := types.ParseUserId(sreg.pkt.from)
+	asUid := types.ParseUserId(sreg.pkt.asUser)
 	asLvl := auth.Level(sreg.pkt.authLvl)
 	toriginal := t.original(asUid)
 
 	if !sreg.newsub && (t.cat == types.TopicCatP2P || t.cat == types.TopicCatGrp || t.cat == types.TopicCatSys) {
 		// Check if this is a new subscription.
-		_, found := t.perUser[asUid]
-		sreg.newsub = !found
+		pud, found := t.perUser[asUid]
+		sreg.newsub = !found || pud.deleted
 	}
 
 	var private interface{}
@@ -885,7 +895,7 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
 	var err error
 	var changed bool
 	// Create new subscription or modify an existing one.
-	if changed, err = t.requestSub(h, sreg.sess, asUid, asLvl, sreg.pkt.id, mode, private, msgsub.Background); err != nil {
+	if changed, err = t.thisUserSub(h, sreg.sess, asUid, asLvl, sreg.pkt.id, mode, private, msgsub.Background); err != nil {
 		return err
 	}
 
@@ -935,7 +945,7 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
 // C. User is responding to an earlier invite (modeWant was "N" in subscription)
 // D. User is already subscribed, changing modeWant
 // E. User is accepting ownership transfer (requesting ownership transfer is not permitted)
-func (t *Topic) requestSub(h *Hub, sess *Session, asUid types.Uid, asLvl auth.Level,
+func (t *Topic) thisUserSub(h *Hub, sess *Session, asUid types.Uid, asLvl auth.Level,
 	pktID, want string, private interface{}, background bool) (bool, error) {
 
 	now := types.TimeNow()
@@ -1196,13 +1206,13 @@ func (t *Topic) requestSub(h *Hub, sess *Session, asUid types.Uid, asLvl auth.Le
 	return changed, nil
 }
 
-// approveSub processes a request to initiate an invite or approve a subscription request from another user.
+// anotherUserSub processes a request to initiate an invite or approve a subscription request from another user.
 // Returns changed == true if user's access mode has changed.
 // Handle these cases:
 // A. Sharer or Approver is inviting another user for the first time (no prior subscription)
 // B. Sharer or Approver is re-inviting another user (adjusting modeGiven, modeWant is still Unset)
 // C. Approver is changing modeGiven for another user, modeWant != Unset
-func (t *Topic) approveSub(h *Hub, sess *Session, asUid, target types.Uid, set *MsgClientSet) (bool, error) {
+func (t *Topic) anotherUserSub(h *Hub, sess *Session, asUid, target types.Uid, set *MsgClientSet) (bool, error) {
 
 	now := types.TimeNow()
 	toriginal := t.original(asUid)
@@ -1313,14 +1323,12 @@ func (t *Topic) approveSub(h *Hub, sess *Session, asUid, target types.Uid, set *
 		usersRegisterUser(target, true)
 
 		// Send push notification for the new subscription.
-		pushRcpt := t.pushForSub(asUid, target, userData.modeWant, userData.modeGiven, now)
-		// TODO: maybe skip user's devices which were online when this event has happened.
-		if pushRcpt != nil {
+		if pushRcpt := t.pushForSub(asUid, target, userData.modeWant, userData.modeGiven, now); pushRcpt != nil {
+			// TODO: maybe skip user's devices which were online when this event has happened.
 			usersPush(pushRcpt)
 		}
 	} else {
 		// Action on an existing subscription: re-invite, change existing permission, confirm/decline request.
-
 		oldGiven = userData.modeGiven
 		oldWant = userData.modeWant
 
@@ -1344,6 +1352,8 @@ func (t *Topic) approveSub(h *Hub, sess *Session, asUid, target types.Uid, set *
 	// Access mode has changed.
 	var changed bool
 	if oldGiven != userData.modeGiven {
+		changed = true
+
 		oldReader := (oldWant & oldGiven).IsReader()
 		newReader := (userData.modeWant & userData.modeGiven).IsReader()
 		if oldReader && !newReader {
@@ -1355,7 +1365,11 @@ func (t *Topic) approveSub(h *Hub, sess *Session, asUid, target types.Uid, set *
 		}
 
 		t.notifySubChange(target, asUid, oldWant, oldGiven, userData.modeWant, userData.modeGiven, sess.sid)
-		changed = true
+	}
+
+	if !userData.modeGiven.IsJoiner() {
+		// The user is banned from the topic.
+		t.evictUser(target, false, "")
 	}
 
 	return changed, nil
@@ -1601,7 +1615,8 @@ func (t *Topic) replySetDesc(sess *Session, asUid types.Uid, set *MsgClientSet) 
 			} else {
 				// Notify all subscribers on 'me' except the user who made the change.
 				// He will be notified separately (see below).
-				t.presSubsOffline("upd", nilPresParams, &presFilters{excludeUser: asUid.UserId()}, sess.sid, false)
+				filter := &presFilters{excludeUser: asUid.UserId()}
+				t.presSubsOffline("upd", nilPresParams, filter, filter, sess.sid, false)
 			}
 
 			t.updated = now
@@ -1784,7 +1799,7 @@ func (t *Topic) replyGetSub(sess *Session, asUid types.Uid, authLevel auth.Level
 					}
 
 					lastSeen := sub.GetLastSeen()
-					if !lastSeen.IsZero() {
+					if !lastSeen.IsZero() && !mts.Online {
 						mts.LastSeen = &MsgLastSeenInfo{
 							When:      &lastSeen,
 							UserAgent: sub.GetUserAgent()}
@@ -1876,7 +1891,7 @@ func (t *Topic) replyGetSub(sess *Session, asUid types.Uid, authLevel auth.Level
 func (t *Topic) replySetSub(h *Hub, sess *Session, pkt *ClientComMessage) error {
 	now := types.TimeNow()
 
-	asUid := types.ParseUserId(pkt.from)
+	asUid := types.ParseUserId(pkt.asUser)
 	asLvl := auth.Level(pkt.authLvl)
 	set := pkt.Set
 	toriginal := t.original(asUid)
@@ -1897,10 +1912,10 @@ func (t *Topic) replySetSub(h *Hub, sess *Session, pkt *ClientComMessage) error 
 	var changed bool
 	if target == asUid {
 		// Request new subscription or modify own subscription
-		changed, err = t.requestSub(h, sess, asUid, asLvl, pkt.id, set.Sub.Mode, nil, false)
+		changed, err = t.thisUserSub(h, sess, asUid, asLvl, pkt.id, set.Sub.Mode, nil, false)
 	} else {
 		// Request to approve/change someone's subscription
-		changed, err = t.approveSub(h, sess, asUid, target, set)
+		changed, err = t.anotherUserSub(h, sess, asUid, target, set)
 	}
 	if err != nil {
 		return err
@@ -2244,7 +2259,7 @@ func (t *Topic) replyDelMsg(sess *Session, asUid types.Uid, del *MsgClientDel) e
 		params := &presParams{delID: t.delID, delSeq: dr, actor: asUid.UserId()}
 		filters := &presFilters{filterIn: types.ModeRead}
 		t.presSubsOnline("del", params.actor, params, filters, sess.sid)
-		t.presSubsOffline("del", params, filters, sess.sid, true)
+		t.presSubsOffline("del", params, filters, nilPresFilters, sess.sid, true)
 	} else {
 		pud := t.perUser[asUid]
 		pud.delID = t.delID
@@ -2468,12 +2483,19 @@ func (t *Topic) evictUser(uid types.Uid, unsub bool, skip string) {
 // 1. New subscription
 // 2. Deleted subscription
 // 3. Permissions changed
-func (t *Topic) notifySubChange(uid, actor types.Uid, oldWant, oldGiven,
-	newWant, newGiven types.AccessMode, skip string) {
+// Sending to
+// (a) Topic admins online on topic itself.
+// (b) Topic admins offline on 'me' if approval is needed.
+// (c) If subscription is deleted, 'gone' to target.
+// (d) 'off' to topic members online if deleted or muted.
+// (e) To target user.
+func (t *Topic) notifySubChange(uid, actor types.Uid,
+	oldWant, oldGiven, newWant, newGiven types.AccessMode, skip string) {
 
 	unsub := newWant == types.ModeUnset || newGiven == types.ModeUnset
 
 	target := uid.UserId()
+
 	dWant := types.ModeNone.String()
 	if newWant.IsDefined() {
 		if oldWant.IsDefined() && !oldWant.IsZero() {
@@ -2497,19 +2519,19 @@ func (t *Topic) notifySubChange(uid, actor types.Uid, oldWant, oldGiven,
 		dWant:  dWant,
 		dGiven: dGiven}
 
+	filter := &presFilters{
+		filterIn:    types.ModeCSharer,
+		excludeUser: target}
+
 	// Announce the change in permissions to the admins who are online in the topic, exclude the target
 	// and exclude the actor's session.
-	t.presSubsOnline("acs", target, params,
-		&presFilters{filterIn: types.ModeCSharer, excludeUser: target},
-		skip)
+	t.presSubsOnline("acs", target, params, filter, skip)
 
 	// If it's a new subscription or if the user asked for permissions in excess of what was granted,
 	// announce the request to topic admins on 'me' so they can approve the request. The notification
 	// is not sent to the target user or the actor's session.
 	if newWant.BetterThan(newGiven) || oldWant == types.ModeNone {
-		t.presSubsOffline("acs", params,
-			&presFilters{filterIn: types.ModeCSharer, excludeUser: target},
-			skip, true)
+		t.presSubsOffline("acs", params, filter, filter, skip, true)
 	}
 
 	// Handling of muting/unmuting.
@@ -2526,11 +2548,7 @@ func (t *Topic) notifySubChange(uid, actor types.Uid, oldWant, oldGiven,
 			presSingleUserOfflineOffline(uid2, target, "off", nilPresParams, "")
 		} else if t.cat == types.TopicCatGrp {
 			// Notify all sharers that the user is offline now.
-			t.presSubsOnline("off", uid.UserId(), nilPresParams,
-				&presFilters{
-					filterIn:    types.ModeCSharer,
-					excludeUser: target},
-				skip)
+			t.presSubsOnline("off", uid.UserId(), nilPresParams, filter, skip)
 		}
 	} else if !(newWant & newGiven).IsPresencer() && (oldWant & oldGiven).IsPresencer() {
 		// Subscription just muted.
@@ -2557,9 +2575,12 @@ func (t *Topic) notifySubChange(uid, actor types.Uid, oldWant, oldGiven,
 		}
 	}
 
-	// Notify requester's other sessions that permissions have changed.
+	// Notify target that permissions have changed.
 	if !unsub {
-		t.presSingleUserOffline(uid, "acs", params, skip, false)
+		// Notify sessions online in the topic.
+		t.presSubsOnlineDirect("acs", params, &presFilters{singleUser: target}, skip)
+		// Notify target's other sessions on 'me'.
+		t.presSingleUserOffline(uid, "acs", params, skip, true)
 	}
 }
 
