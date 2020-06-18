@@ -9,7 +9,6 @@
 package main
 
 import (
-	"container/list"
 	"errors"
 	"log"
 	"sort"
@@ -22,10 +21,6 @@ import (
 	"github.com/tinode/chat/server/store/types"
 )
 
-// Time between subscription of a background session and when the notifications are sent.
-// If session unsubscribes in this time frame notifications are not sent at all.
-const deferredNotificationsTimeout = time.Second * 5
-
 // Topic is an isolated communication channel
 type Topic struct {
 	// Еxpanded/unique name of the topic.
@@ -37,7 +32,6 @@ type Topic struct {
 	// Topic category
 	cat types.TopicCat
 
-	// TODO(gene): currently unused
 	// If isProxy == true, the actual topic is hosted by another cluster member.
 	// The topic should:
 	// 1. forward all messages to master
@@ -46,6 +40,8 @@ type Topic struct {
 	// 4. shut down the topic at master's request.
 	// 5. aggregate access permissions on behalf of attached sessions.
 	isProxy bool
+	// Name of the master node for this topic if isProxy is true.
+	masterNode string
 
 	// Time when the topic was first created.
 	created time.Time
@@ -77,6 +73,13 @@ type Topic struct {
 
 	// Topic's per-subscriber data
 	perUser map[types.Uid]perUserData
+	// Union of permissions across all users (used by proxy sessions with uid = 0).
+	// These are used by master topics only (in the proxy-master topic context)
+	// as a coarse-grained attempt to perform acs checks since proxy sessions "impersonate"
+	// multiple normal sessions (uids) which may have different uids.
+	modeWantUnion  types.AccessMode
+	modeGivenUnion types.AccessMode
+
 	// User's contact list (not nil for 'me' topic only).
 	// The map keys are UserIds for P2P topics and grpXXX for group topics.
 	perSubs map[string]perSubsData
@@ -84,8 +87,6 @@ type Topic struct {
 	// Sessions attached to this topic. The UID kept here may not match Session.uid if session is
 	// subscribed on behalf of another user.
 	sessions map[*Session]perSessionData
-	// Queue of delayed presence updates from successful service (background) subscriptions.
-	defrNotif *list.List
 
 	// Inbound {data} and {pres} messages from sessions or other topics, already converted to SCM. Buffered = 256
 	broadcast chan *ServerComMessage
@@ -95,10 +96,14 @@ type Topic struct {
 	reg chan *sessionJoin
 	// Unsubscribe requests from sessions, buffered = 32
 	unreg chan *sessionLeave
-	// Track the most active sessions to report User Agent changes. Buffered = 32
-	uaChange chan string
+	// Session updates: background sessions coming online, User Agent changes. Buffered = 32
+	supd chan *sessionUpdate
 	// Channel to terminate topic  -- either the topic is deleted or system is being shut down. Buffered = 1.
 	exit chan *shutDown
+	// Channel to receive topic master responses (used only by proxy topics).
+	proxy chan *ClusterResp
+	// Channel to receive topic proxy service requests, e.g. sending deferred notifications.
+	master chan *ClusterSessUpdate
 
 	// Flag which tells topic lifecycle status: new, ready, paused, marked for deletion.
 	status int32
@@ -142,9 +147,10 @@ type perSubsData struct {
 // Data related to a subscription of a session to a topic.
 type perSessionData struct {
 	// ID of the subscribed user (asUid); not necessarily the session owner.
+	// Could be zero for multiplexed sessions in cluster.
 	uid types.Uid
-	// Reference to a list bucket with deferred notification or nil if no notifications are deferred.
-	ref *list.Element
+	// IDs of subscribed users in a multiplexing session.
+	muids []types.Uid
 }
 
 // Reasons why topic is being shut down.
@@ -167,12 +173,95 @@ type shutDown struct {
 	reason int
 }
 
+// Session update: user agent change or background session becoming normal.
+// If sess is nil then user agent change, otherwise bg to fg update.
+type sessionUpdate struct {
+	sess      *Session
+	userAgent string
+}
+
 var nilPresParams = &presParams{}
 var nilPresFilters = &presFilters{}
 
 func (t *Topic) run(hub *Hub) {
+	if !t.isProxy {
+		t.runLocal(hub)
+	} else {
+		t.runProxy(hub)
+	}
+}
+
+// getPerUserAcs returns `want` and `given` permissions for the given user id.
+func (t *Topic) getPerUserAcs(uid types.Uid) (types.AccessMode, types.AccessMode) {
+	if uid.IsZero() {
+		// For zero uids (typically for proxy sessions), return the union of all permissions.
+		return t.modeWantUnion, t.modeGivenUnion
+	} else {
+		pud := t.perUser[uid]
+		return pud.modeWant, pud.modeGiven
+	}
+}
+
+// passesPresenceFilters applies presence filters to `msg`
+// depending on per-user want and given acls for the provided `uid`.
+func (t *Topic) passesPresenceFilters(msg *ServerComMessage, uid types.Uid) bool {
+	modeWant, modeGiven := t.getPerUserAcs(uid)
+	// "gone" and "acs" notifications are sent even if the topic is muted.
+	return ((modeGiven & modeWant).IsPresencer() || msg.Pres.What == "gone" || msg.Pres.What == "acs") &&
+		(msg.Pres.FilterIn == 0 || int(modeGiven&modeWant)&msg.Pres.FilterIn != 0) &&
+		(msg.Pres.FilterOut == 0 || int(modeGiven&modeWant)&msg.Pres.FilterOut == 0)
+}
+
+// userIsReader returns true if the user (specified by `uid`) may read the given topic.
+func (t *Topic) userIsReader(uid types.Uid) bool {
+	modeWant, modeGiven := t.getPerUserAcs(uid)
+	return (modeGiven & modeWant).IsReader()
+}
+
+// maybeFixTopicName sets the topic field in `msg` depending on the uid.
+func (t *Topic) maybeFixTopicName(msg *ServerComMessage, uid types.Uid) {
+	if !uid.IsZero() && t.cat == types.TopicCatP2P {
+		// For p2p topics topic name is dependent on receiver.
+		// For zero uids we don't know the proper topic name, though.
+		switch {
+		case msg.Data != nil:
+			msg.Data.Topic = t.original(uid)
+		case msg.Pres != nil:
+			msg.Pres.Topic = t.original(uid)
+		case msg.Info != nil:
+			msg.Info.Topic = t.original(uid)
+		}
+	}
+}
+
+// computePerUserAcsUnion computes want and given permissions unions over all topic's subscribers.
+func (t *Topic) computePerUserAcsUnion() {
+	wantUnion := types.ModeNone
+	givenUnion := types.ModeNone
+	for _, pud := range t.perUser {
+		wantUnion = wantUnion | pud.modeWant
+		givenUnion = givenUnion | pud.modeGiven
+	}
+	t.modeWantUnion = wantUnion
+	t.modeGivenUnion = givenUnion
+}
+
+// fixUpUserCounts decrements online counts for the provided user ids.
+func (t *Topic) fixUpUserCounts(userCounts map[types.Uid]int) {
+	for uid, decrementBy := range userCounts {
+		if pud, ok := t.perUser[uid]; ok {
+			pud.online -= decrementBy
+			t.perUser[uid] = pud
+			if pud.online < 0 {
+				log.Printf("topic[%s]: invalid online count for user %s", t.name, uid)
+			}
+		}
+	}
+}
+
+func (t *Topic) runLocal(hub *Hub) {
 	// Kills topic after a period of inactivity.
-	keepAlive := idleTopicTimeout
+	keepAlive := idleMasterTopicTimeout
 	killTimer := time.NewTimer(time.Hour)
 	killTimer.Stop()
 
@@ -186,18 +275,17 @@ func (t *Topic) run(hub *Hub) {
 
 	for {
 		select {
-		case sreg := <-t.reg:
+		case join := <-t.reg:
 			// Request to add a connection to this topic
-
 			if t.isInactive() {
-				asUid := types.ParseUserId(sreg.pkt.asUser)
-				sreg.sess.queueOut(ErrLocked(sreg.pkt.id, t.original(asUid), types.TimeNow()))
+				asUid := types.ParseUserId(join.pkt.AsUser)
+				join.sess.queueOut(ErrLocked(join.pkt.Id, t.original(asUid), types.TimeNow()))
 			} else {
 				// The topic is alive, so stop the kill timer, if it's ticking. We don't want the topic to die
 				// while processing the call
 				killTimer.Stop()
-				if err := t.handleSubscription(hub, sreg); err == nil {
-					if sreg.created {
+				if err := t.handleSubscription(hub, join); err == nil {
+					if join.pkt.Sub.Created {
 						// Call plugins with the new topic
 						pluginTopic(t, plgActCreate)
 					}
@@ -206,7 +294,7 @@ func (t *Topic) run(hub *Hub) {
 						// Failed to subscribe, the topic is still inactive
 						killTimer.Reset(keepAlive)
 					}
-					log.Printf("topic[%s] subscription failed %v, sid=%s", t.name, err, sreg.sess.sid)
+					log.Printf("topic[%s] subscription failed %v, sid=%s", t.name, err, join.sess.sid)
 				}
 			}
 		case leave := <-t.unreg:
@@ -214,28 +302,54 @@ func (t *Topic) run(hub *Hub) {
 			now := types.TimeNow()
 
 			// userId.IsZero() == true when the entire session is being dropped.
-			asUid := leave.userId
+			var asUid types.Uid
+			if leave.pkt != nil {
+				asUid = types.ParseUserId(leave.pkt.AsUser)
+			}
 
 			if t.isInactive() {
-				if !asUid.IsZero() && leave.id != "" {
-					leave.sess.queueOut(ErrLocked(leave.id, t.original(asUid), now))
+				if !asUid.IsZero() && leave.pkt != nil {
+					leave.sess.queueOut(ErrLocked(leave.pkt.Id, t.original(asUid), now))
 				}
 				continue
 
-			} else if leave.unsub {
+			} else if leave.pkt != nil && leave.pkt.Leave.Unsub {
 				// User wants to leave and unsubscribe.
 				// asUid must not be Zero.
-				if err := t.replyLeaveUnsub(hub, leave.sess, asUid, leave.id); err != nil {
+				if err := t.replyLeaveUnsub(hub, leave.sess, asUid, leave.pkt.Id); err != nil {
 					log.Println("failed to unsub", err, leave.sess.sid)
 					continue
 				}
+			} else if pssd, _ := t.remSession(leave.sess, asUid); pssd != nil {
+				// Just leaving the topic without unsubscribing.
 
-			} else if pssd := t.remSession(leave.sess, asUid); pssd != nil {
-				// Just leaving the topic without unsubscribing if user is subscribed.
+				var uid types.Uid
+				if leave.sess.isProxy() {
+					// Multiplexing session, multiple UIDs.
+					uid = asUid
+				} else {
+					// Simple session, single UID.
+					uid = pssd.uid
+				}
 
-				pud := t.perUser[pssd.uid]
-				if pssd.ref == nil {
-					pud.online--
+				var pud perUserData
+				// uid may be zero when a proxy session is trying to terminate (it called unsubAll).
+				if !uid.IsZero() {
+					// UID not zero: one user removed.
+					pud = t.perUser[uid]
+					if !leave.sess.background {
+						pud.online--
+					}
+				} else if len(pssd.muids) > 0 {
+					// UID is zero: multiplexing session is dropped alltogether.
+					// Using new 'uid' and 'pud' variables.
+					for _, uid := range pssd.muids {
+						pud := t.perUser[uid]
+						pud.online--
+						t.perUser[uid] = pud
+					}
+				} else if !leave.sess.isCluster() {
+					log.Panic("cannot determine uid: leave req=", leave)
 				}
 
 				switch t.cat {
@@ -247,29 +361,48 @@ func (t *Topic) run(hub *Hub) {
 					} else {
 						// Change UA to the most recent live session and announce it. Don't block.
 						select {
-						case t.uaChange <- mrs.userAgent:
+						case t.supd <- &sessionUpdate{userAgent: mrs.userAgent}:
 						default:
 						}
 					}
-					// Update user's last online timestamp & user agent
-					if err := store.Users.UpdateLastSeen(pssd.uid, mrs.userAgent, now); err != nil {
+
+					meUid := uid
+					if meUid.IsZero() {
+						// The entire multiplexing session is being dropped. Need to find owner's UID.
+						// May panic only if pssd.muids is empty, but it should not be empty at this point.
+						meUid = pssd.muids[0]
+					}
+					// Update user's last online timestamp & user agent. Only one user can be subscribed to 'me' topic.
+					if err := store.Users.UpdateLastSeen(meUid, mrs.userAgent, now); err != nil {
 						log.Println(err)
 					}
 				case types.TopicCatFnd:
+					// FIXME: this does not work correctly in case of a multiplexing query.
 					// Remove ephemeral query.
 					t.fndRemovePublic(leave.sess)
 				case types.TopicCatGrp:
-					if pud.online == 0 {
-						// User is going offline: notify online subscribers on 'me'
-						t.presSubsOnline("off", pssd.uid.UserId(), nilPresParams,
-							&presFilters{filterIn: types.ModeRead}, "")
+					// Topic is going offline: notify online subscribers on 'me'.
+					readFilter := &presFilters{filterIn: types.ModeRead}
+					if !uid.IsZero() {
+						if pud.online == 0 {
+							t.presSubsOnline("off", uid.UserId(), nilPresParams, readFilter, "")
+						}
+					} else if len(pssd.muids) > 0 {
+						for _, uid := range pssd.muids {
+							if t.perUser[uid].online == 0 {
+								t.presSubsOnline("off", uid.UserId(), nilPresParams, readFilter, "")
+							}
+						}
 					}
 				}
 
-				t.perUser[pssd.uid] = pud
+				if !uid.IsZero() {
+					t.perUser[uid] = pud
 
-				if leave.id != "" {
-					leave.sess.queueOut(NoErr(leave.id, t.original(asUid), now))
+					// Respond if contains an id.
+					if leave.pkt != nil {
+						leave.sess.queueOut(NoErr(leave.pkt.Id, t.original(uid), now))
+					}
 				}
 			}
 
@@ -280,277 +413,41 @@ func (t *Topic) run(hub *Hub) {
 
 		case msg := <-t.broadcast:
 			// Content message intended for broadcasting to recipients
-
-			var pushRcpt *push.Receipt
-			asUid := types.ParseUserId(msg.asUser)
-			if msg.Data != nil {
-				if t.isInactive() {
-					msg.sess.queueOut(ErrLocked(msg.id, t.original(asUid), msg.timestamp))
-					continue
-				}
-				if t.isReadOnly() {
-					msg.sess.queueOut(ErrPermissionDenied(msg.id, t.original(asUid), msg.timestamp))
-					continue
-				}
-
-				asUser := types.ParseUserId(msg.Data.From)
-				userData, userFound := t.perUser[asUser]
-				// Anyone is allowed to post to 'sys' topic.
-				if t.cat != types.TopicCatSys {
-					// If it's not 'sys' check write permission.
-					if !(userData.modeWant & userData.modeGiven).IsWriter() {
-						msg.sess.queueOut(ErrPermissionDenied(msg.id, t.original(asUid),
-							msg.timestamp))
-						continue
-					}
-				}
-
-				if err := store.Messages.Save(&types.Message{
-					ObjHeader: types.ObjHeader{CreatedAt: msg.Data.Timestamp},
-					SeqId:     t.lastID + 1,
-					Topic:     t.name,
-					From:      asUser.String(),
-					Head:      msg.Data.Head,
-					Content:   msg.Data.Content}, (userData.modeGiven & userData.modeWant).IsReader()); err != nil {
-
-					log.Printf("topic[%s]: failed to save message: %v", t.name, err)
-					msg.sess.queueOut(ErrUnknown(msg.id, t.original(asUid), msg.timestamp))
-
-					continue
-				}
-
-				t.lastID++
-				t.touched = msg.Data.Timestamp
-				msg.Data.SeqId = t.lastID
-				if userFound {
-					userData.readID = t.lastID
-					userData.readID = t.lastID
-					t.perUser[asUser] = userData
-				}
-				if msg.id != "" {
-					reply := NoErrAccepted(msg.id, t.original(asUid), msg.timestamp)
-					reply.Ctrl.Params = map[string]int{"seq": t.lastID}
-					msg.sess.queueOut(reply)
-				}
-
-				pushRcpt = t.pushForData(asUser, msg.Data)
-
-				// Message sent: notify offline 'R' subscrbers on 'me'
-				t.presSubsOffline("msg", &presParams{seqID: t.lastID, actor: msg.Data.From},
-					&presFilters{filterIn: types.ModeRead}, nilPresFilters, "", true)
-
-				// Tell the plugins that a message was accepted for delivery
-				pluginMessage(msg.Data, plgActCreate)
-
-			} else if msg.Pres != nil {
-				if t.isInactive() {
-					// Ignore presence update - topic is paused or being deleted
-					continue
-				}
-
-				what := t.presProcReq(msg.Pres.Src, msg.Pres.What, msg.Pres.WantReply)
-				if t.xoriginal != msg.Pres.Topic || what == "" {
-					// This is just a request for status, don't forward it to sessions
-					continue
-				}
-
-				// "what" may have changed, i.e. unset or "+command" removed ("on+en" -> "on")
-				msg.Pres.What = what
-			} else if msg.Info != nil {
-				if t.isInactive() {
-					// Ignore info messages - topic is paused or being deleted
-					continue
-				}
-
-				if msg.Info.SeqId > t.lastID {
-					// Drop bogus read notification
-					continue
-				}
-
-				asUser := types.ParseUserId(msg.Info.From)
-				pud := t.perUser[asUser]
-
-				// Filter out "kp" from users with no 'W' permission (or people without a subscription)
-				if msg.Info.What == "kp" && (!(pud.modeGiven & pud.modeWant).IsWriter() || t.isReadOnly()) {
-					continue
-				}
-
-				if msg.Info.What == "read" || msg.Info.What == "recv" {
-					// Filter out "read/recv" from users with no 'R' permission (or people without a subscription)
-					if !(pud.modeGiven & pud.modeWant).IsReader() {
-						continue
-					}
-
-					var read, recv, unread int
-					if msg.Info.What == "read" {
-						if msg.Info.SeqId > pud.readID {
-							// The number of unread messages has decreased, negative value
-							unread = pud.readID - msg.Info.SeqId
-							pud.readID = msg.Info.SeqId
-							read = pud.readID
-						} else {
-							// No need to report stale or bogus read status
-							continue
-						}
-					} else if msg.Info.What == "recv" {
-						if msg.Info.SeqId > pud.recvID {
-							pud.recvID = msg.Info.SeqId
-							recv = pud.recvID
-						} else {
-							continue
-						}
-					}
-
-					if pud.readID > pud.recvID {
-						pud.recvID = pud.readID
-						recv = pud.recvID
-					}
-
-					if err := store.Subs.Update(t.name, asUser,
-						map[string]interface{}{
-							"RecvSeqId": pud.recvID,
-							"ReadSeqId": pud.readID},
-						false); err != nil {
-
-						log.Printf("topic[%s]: failed to update SeqRead/Recv counter: %v", t.name, err)
-						continue
-					}
-
-					// Read/recv updated: notify user's other sessions of the change
-					t.presPubMessageCount(asUser, recv, read, msg.skipSid)
-
-					// Update cached count of unread messages
-					usersUpdateUnread(asUser, unread, true)
-
-					t.perUser[asUser] = pud
-				}
-			}
-
-			// Broadcast the message. Only {data}, {pres}, {info} are broadcastable.
-			// {meta} and {ctrl} are sent to the session only
-			if msg.Data != nil || msg.Pres != nil || msg.Info != nil {
-				for sess, pssd := range t.sessions {
-					if sess.sid == msg.skipSid {
-						continue
-					}
-
-					if msg.Pres != nil {
-						// Skip notifying - already notified on topic.
-						if msg.Pres.SkipTopic != "" && sess.getSub(msg.Pres.SkipTopic) != nil {
-							continue
-						}
-
-						// Notification addressed to a single user only.
-						if msg.Pres.SingleUser != "" && pssd.uid.UserId() != msg.Pres.SingleUser {
-							continue
-						}
-						// Notification should skip a single user.
-						if msg.Pres.ExcludeUser != "" && pssd.uid.UserId() == msg.Pres.ExcludeUser {
-							continue
-						}
-
-						// Check presence filters
-						pud := t.perUser[pssd.uid]
-						// Send "gone" and "acs" notifications even if the topic is muted.
-						if (!(pud.modeGiven & pud.modeWant).IsPresencer() && msg.Pres.What != "gone" && msg.Pres.What != "acs") ||
-							(msg.Pres.FilterIn != 0 && int(pud.modeGiven&pud.modeWant)&msg.Pres.FilterIn == 0) ||
-							(msg.Pres.FilterOut != 0 && int(pud.modeGiven&pud.modeWant)&msg.Pres.FilterOut != 0) {
-							continue
-						}
-
-					} else {
-						// Check if the user has Read permission
-						pud := t.perUser[pssd.uid]
-						if !(pud.modeGiven & pud.modeWant).IsReader() {
-							continue
-						}
-
-						// Don't send key presses from one user's session to the other sessions of the same user.
-						if msg.Info != nil && msg.Info.What == "kp" && msg.Info.From == pssd.uid.UserId() {
-							continue
-						}
-					}
-
-					if t.cat == types.TopicCatP2P {
-						// For p2p topics topic name is dependent on receiver
-						switch {
-						case msg.Data != nil:
-							msg.Data.Topic = t.original(pssd.uid)
-						case msg.Pres != nil:
-							msg.Pres.Topic = t.original(pssd.uid)
-						case msg.Info != nil:
-							msg.Info.Topic = t.original(pssd.uid)
-						}
-					}
-
-					if sess.queueOut(msg) {
-						// Update device map with the device ID which should NOT receive the notification.
-						if pushRcpt != nil {
-							if addr, ok := pushRcpt.To[pssd.uid]; ok {
-								if pssd.ref == nil {
-									// Count foreground sessions only, background sessions are automated
-									// and should not affect pushes to other devices.
-									addr.Delivered++
-								}
-								if sess.deviceID != "" {
-									// List of device IDs which already received the message. Push should
-									// skip them.
-									// The same device ID may appear twice.
-									addr.Devices = append(addr.Devices, sess.deviceID)
-								}
-								pushRcpt.To[pssd.uid] = addr
-							}
-						}
-					} else {
-						log.Printf("topic[%s]: connection stuck, detaching", t.name)
-						// The whole session is being dropped, so sessionLeave.userId is not set.
-						t.unreg <- &sessionLeave{sess: sess}
-					}
-				}
-
-				if pushRcpt != nil {
-					// usersPush will update unread message count and send push notification.
-					usersPush(pushRcpt)
-				}
-
-			} else {
-				// TODO(gene): remove this
-				log.Panic("topic: wrong message type for broadcasting", t.name)
-			}
+			t.handleBroadcast(msg)
 
 		case meta := <-t.meta:
 			// Request to get/set topic metadata
-			asUid := types.ParseUserId(meta.pkt.asUser)
-			authLevel := auth.Level(meta.pkt.authLvl)
+			asUid := types.ParseUserId(meta.pkt.AsUser)
+			authLevel := auth.Level(meta.pkt.AuthLvl)
 			switch {
 			case meta.pkt.Get != nil:
 				// Get request
-				if meta.what&constMsgMetaDesc != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaDesc != 0 {
 					if err := t.replyGetDesc(meta.sess, asUid, meta.pkt.Get.Id, meta.pkt.Get.Desc); err != nil {
 						log.Printf("topic[%s] meta.Get.Desc failed: %s", t.name, err)
 					}
 				}
-				if meta.what&constMsgMetaSub != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaSub != 0 {
 					if err := t.replyGetSub(meta.sess, asUid, authLevel, meta.pkt.Get.Id, meta.pkt.Get.Sub); err != nil {
 						log.Printf("topic[%s] meta.Get.Sub failed: %s", t.name, err)
 					}
 				}
-				if meta.what&constMsgMetaData != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaData != 0 {
 					if err := t.replyGetData(meta.sess, asUid, meta.pkt.Get.Id, meta.pkt.Get.Data); err != nil {
 						log.Printf("topic[%s] meta.Get.Data failed: %s", t.name, err)
 					}
 				}
-				if meta.what&constMsgMetaDel != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaDel != 0 {
 					if err := t.replyGetDel(meta.sess, asUid, meta.pkt.Get.Id, meta.pkt.Get.Del); err != nil {
 						log.Printf("topic[%s] meta.Get.Del failed: %s", t.name, err)
 					}
 				}
-				if meta.what&constMsgMetaTags != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaTags != 0 {
 					if err := t.replyGetTags(meta.sess, asUid, meta.pkt.Get.Id); err != nil {
 						log.Printf("topic[%s] meta.Get.Tags failed: %s", t.name, err)
 					}
 				}
-				if meta.what&constMsgMetaCred != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaCred != 0 {
 					log.Printf("topic[%s] handle getCred", t.name)
 					if err := t.replyGetCreds(meta.sess, asUid, meta.pkt.Get.Id); err != nil {
 						log.Printf("topic[%s] meta.Get.Creds failed: %s", t.name, err)
@@ -559,7 +456,7 @@ func (t *Topic) run(hub *Hub) {
 
 			case meta.pkt.Set != nil:
 				// Set request
-				if meta.what&constMsgMetaDesc != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaDesc != 0 {
 					if err := t.replySetDesc(meta.sess, asUid, meta.pkt.Set); err == nil {
 						// Notify plugins of the update
 						pluginTopic(t, plgActUpd)
@@ -567,17 +464,17 @@ func (t *Topic) run(hub *Hub) {
 						log.Printf("topic[%s] meta.Set.Desc failed: %v", t.name, err)
 					}
 				}
-				if meta.what&constMsgMetaSub != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaSub != 0 {
 					if err := t.replySetSub(hub, meta.sess, meta.pkt); err != nil {
 						log.Printf("topic[%s] meta.Set.Sub failed: %v", t.name, err)
 					}
 				}
-				if meta.what&constMsgMetaTags != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaTags != 0 {
 					if err := t.replySetTags(meta.sess, asUid, meta.pkt.Set); err != nil {
 						log.Printf("topic[%s] meta.Set.Tags failed: %v", t.name, err)
 					}
 				}
-				if meta.what&constMsgMetaCred != 0 {
+				if meta.pkt.MetaWhat&constMsgMetaCred != 0 {
 					if err := t.replySetCred(meta.sess, asUid, authLevel, meta.pkt.Set); err != nil {
 						log.Printf("topic[%s] meta.Set.Cred failed: %v", t.name, err)
 					}
@@ -586,7 +483,7 @@ func (t *Topic) run(hub *Hub) {
 			case meta.pkt.Del != nil:
 				// Del request
 				var err error
-				switch meta.what {
+				switch meta.pkt.MetaWhat {
 				case constMsgDelMsg:
 					err = t.replyDelMsg(meta.sess, asUid, meta.pkt.Del)
 				case constMsgDelSub:
@@ -601,35 +498,17 @@ func (t *Topic) run(hub *Hub) {
 					log.Printf("topic[%s] meta.Del failed: %v", t.name, err)
 				}
 			}
-		case ua := <-t.uaChange:
-			// Process an update to user agent from one of the sessions
-			currentUA = ua
-			uaTimer.Reset(uaTimerDelay)
-
-		case <-defrNotifTimer.C:
-			// Handle deferred presence notifications from a successful service (background) subscription.
-			if t.isInactive() {
-				continue
-			}
-
-			// Process events older than this timestamp.
-			expiration := time.Now().Add(-deferredNotificationsTimeout)
-			// Iterate through the list until all sufficiently old events are processed.
-			for elem := t.defrNotif.Back(); elem != nil; elem = t.defrNotif.Back() {
-				sreg := elem.Value.(*sessionJoin)
-				if expiration.Before(sreg.pkt.timestamp) {
-					// All done. Remaining events are newer.
-					break
+		case upd := <-t.supd:
+			if upd.sess != nil {
+				// 'me' & 'grp' only. Background session timed out and came online.
+				t.sessToForeground(upd.sess)
+			} else if currentUA != upd.userAgent {
+				if t.cat != types.TopicCatMe {
+					log.Panicln("invalid topic category in UA update", t.name)
 				}
-				t.defrNotif.Remove(elem)
-				if pssd, ok := t.sessions[sreg.sess]; ok {
-					userData := t.perUser[pssd.uid]
-					userData.online++
-					t.perUser[pssd.uid] = userData
-					pssd.ref = nil
-					t.sessions[sreg.sess] = pssd
-				}
-				t.sendSubNotifications(types.ParseUserId(sreg.pkt.asUser), sreg)
+				// 'me' only. Process an update to user agent from one of the sessions.
+				currentUA = upd.userAgent
+				uaTimer.Reset(uaTimerDelay)
 			}
 
 		case <-uaTimer.C:
@@ -642,7 +521,7 @@ func (t *Topic) run(hub *Hub) {
 
 		case <-killTimer.C:
 			// Topic timeout
-			hub.unreg <- &topicUnreg{topic: t.name}
+			hub.unreg <- &topicUnreg{rcptTo: t.name}
 			defrNotifTimer.Stop()
 			if t.cat == types.TopicCatMe {
 				uaTimer.Stop()
@@ -691,78 +570,98 @@ func (t *Topic) run(hub *Hub) {
 }
 
 // Session subscribed to a topic, created == true if topic was just created and {pres} needs to be announced
-func (t *Topic) handleSubscription(h *Hub, sreg *sessionJoin) error {
-	asUid := types.ParseUserId(sreg.pkt.asUser)
-	authLevel := auth.Level(sreg.pkt.authLvl)
+func (t *Topic) handleSubscription(h *Hub, join *sessionJoin) error {
+	asUid := types.ParseUserId(join.pkt.AsUser)
+	authLevel := auth.Level(join.pkt.AuthLvl)
 
-	msgsub := sreg.pkt.Sub
+	msgsub := join.pkt.Sub
 	getWhat := 0
 	if msgsub.Get != nil {
 		getWhat = parseMsgClientMeta(msgsub.Get.What)
 	}
 
-	if err := t.subCommonReply(h, sreg); err != nil {
+	if err := t.subscriptionReply(h, join); err != nil {
 		return err
 	}
 
 	// Send notifications.
 
 	// Some notifications are always sent immediately.
-	t.sendImmediateSubNotifications(asUid, sreg)
+	t.sendImmediateSubNotifications(asUid, join)
 
-	pssd, ok := t.sessions[sreg.sess]
-	if msgsub.Background && ok {
-		// Notifications are delayed.
-		pssd.ref = t.defrNotif.PushFront(sreg)
-		t.sessions[sreg.sess] = pssd
-	} else {
-		// Remaining notifications are also sent immediately.
-		t.sendSubNotifications(asUid, sreg)
+	if !join.sess.background {
+		// Remaining notifications are also sent immediately for foreground sessions.
+		t.sendSubNotifications(asUid, join.sess.sid, join.sess.userAgent)
 	}
 
 	if getWhat&constMsgMetaDesc != 0 {
 		// Send get.desc as a {meta} packet.
-		if err := t.replyGetDesc(sreg.sess, asUid, sreg.pkt.id, msgsub.Get.Desc); err != nil {
-			log.Printf("topic[%s] handleSubscription Get.Desc failed: %v sid=%s", t.name, err, sreg.sess.sid)
+		if err := t.replyGetDesc(join.sess, asUid, join.pkt.Id, msgsub.Get.Desc); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Desc failed: %v sid=%s", t.name, err, join.sess.sid)
 		}
 	}
 
 	if getWhat&constMsgMetaSub != 0 {
 		// Send get.sub response as a separate {meta} packet
-		if err := t.replyGetSub(sreg.sess, asUid, authLevel, sreg.pkt.id, msgsub.Get.Sub); err != nil {
-			log.Printf("topic[%s] handleSubscription Get.Sub failed: %v sid=%s", t.name, err, sreg.sess.sid)
+		if err := t.replyGetSub(join.sess, asUid, authLevel, join.pkt.Id, msgsub.Get.Sub); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Sub failed: %v sid=%s", t.name, err, join.sess.sid)
 		}
 	}
 
 	if getWhat&constMsgMetaTags != 0 {
 		// Send get.tags response as a separate {meta} packet
-		if err := t.replyGetTags(sreg.sess, asUid, sreg.pkt.id); err != nil {
-			log.Printf("topic[%s] handleSubscription Get.Tags failed: %v sid=%s", t.name, err, sreg.sess.sid)
+		if err := t.replyGetTags(join.sess, asUid, join.pkt.Id); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Tags failed: %v sid=%s", t.name, err, join.sess.sid)
 		}
 	}
 
 	if getWhat&constMsgMetaCred != 0 {
 		// Send get.tags response as a separate {meta} packet
-		if err := t.replyGetCreds(sreg.sess, asUid, sreg.pkt.id); err != nil {
-			log.Printf("topic[%s] handleSubscription Get.Cred failed: %v sid=%s", t.name, err, sreg.sess.sid)
+		if err := t.replyGetCreds(join.sess, asUid, join.pkt.Id); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Cred failed: %v sid=%s", t.name, err, join.sess.sid)
 		}
 	}
 
 	if getWhat&constMsgMetaData != 0 {
 		// Send get.data response as {data} packets
-		if err := t.replyGetData(sreg.sess, asUid, sreg.pkt.id, msgsub.Get.Data); err != nil {
-			log.Printf("topic[%s] handleSubscription Get.Data failed: %v sid=%s", t.name, err, sreg.sess.sid)
+		if err := t.replyGetData(join.sess, asUid, join.pkt.Id, msgsub.Get.Data); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Data failed: %v sid=%s", t.name, err, join.sess.sid)
 		}
 	}
 
 	if getWhat&constMsgMetaDel != 0 {
 		// Send get.del response as a separate {meta} packet
-		if err := t.replyGetDel(sreg.sess, asUid, sreg.pkt.id, msgsub.Get.Del); err != nil {
-			log.Printf("topic[%s] handleSubscription Get.Del failed: %v sid=%s", t.name, err, sreg.sess.sid)
+		if err := t.replyGetDel(join.sess, asUid, join.pkt.Id, msgsub.Get.Del); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Del failed: %v sid=%s", t.name, err, join.sess.sid)
 		}
 	}
 
 	return nil
+}
+
+// sessToForeground updates perUser online status accounting and fires due
+// deferred notifications for the provided session.
+func (t *Topic) sessToForeground(sess *Session) {
+	s := sess
+	if s.multi != nil {
+		s = s.multi
+	}
+
+	if pssd, ok := t.sessions[s]; ok {
+		uid := pssd.uid
+		if s.isMultiplex() {
+			// If 's' is a multiplexing session, then sess is a proxy and it contains correct UID.
+			// Add UID to the list of online users.
+			uid := sess.uid
+			pssd.muids = append(pssd.muids, uid)
+		}
+		// Mark user as online
+		pud := t.perUser[uid]
+		pud.online++
+		t.perUser[uid] = pud
+
+		t.sendSubNotifications(uid, sess.sid, sess.userAgent)
+	}
 }
 
 // Send immediate presence notification in response to a subscription.
@@ -776,14 +675,14 @@ func (t *Topic) sendImmediateSubNotifications(asUid types.Uid, sreg *sessionJoin
 		pud2 := t.perUser[uid2]
 
 		// Inform the other user that the topic was just created.
-		if sreg.created {
+		if sreg.pkt.Sub.Created {
 			t.presSingleUserOffline(uid2, "acs", &presParams{
 				dWant:  pud2.modeWant.String(),
 				dGiven: pud2.modeGiven.String(),
 				actor:  asUid.UserId()}, "", false)
 		}
 
-		if sreg.newsub {
+		if sreg.pkt.Sub.Newsub {
 			// Notify current user's 'me' topic to accept notifications from user2
 			t.presSingleUserOffline(asUid, "?none+en", nilPresParams, "", false)
 
@@ -806,7 +705,7 @@ func (t *Topic) sendImmediateSubNotifications(asUid types.Uid, sreg *sessionJoin
 	}
 
 	// newsub could be true only for p2p and group topics, no need to check topic category explicitly.
-	if sreg.newsub {
+	if sreg.pkt.Sub.Newsub {
 		// Notify creator's other sessions that the subscription (or the entire topic) was created.
 		t.presSingleUserOffline(asUid, "acs",
 			&presParams{
@@ -818,7 +717,7 @@ func (t *Topic) sendImmediateSubNotifications(asUid types.Uid, sreg *sessionJoin
 }
 
 // Send immediate or deferred presence notification in response to a subscription.
-func (t *Topic) sendSubNotifications(asUid types.Uid, sreg *sessionJoin) {
+func (t *Topic) sendSubNotifications(asUid types.Uid, sid, userAgent string) {
 	pud := t.perUser[asUid]
 
 	switch t.cat {
@@ -830,7 +729,7 @@ func (t *Topic) sendSubNotifications(asUid types.Uid, sreg *sessionJoin) {
 				log.Println("topic: failed to load contacts", t.name, err.Error())
 			}
 			// User online: notify users of interest without forcing response (no +en here).
-			t.presUsersOfInterest("on", sreg.sess.userAgent)
+			t.presUsersOfInterest("on", userAgent)
 		}
 
 	case types.TopicCatGrp:
@@ -848,31 +747,246 @@ func (t *Topic) sendSubNotifications(asUid types.Uid, sreg *sessionJoin) {
 			// If this is the first session of the user in the topic.
 			// Notify other online group members that the user is online now.
 			t.presSubsOnline("on", asUid.UserId(), nilPresParams,
-				&presFilters{filterIn: types.ModeRead}, sreg.sess.sid)
+				&presFilters{filterIn: types.ModeRead}, sid)
 		}
 	}
 }
 
-// subCommonReply generates a response to a subscription request
-func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
+// handleBroadcast fans out broadcastable messages to recepients in topic and proxy_topic.
+func (t *Topic) handleBroadcast(msg *ServerComMessage) {
+	asUid := types.ParseUserId(msg.AsUser)
+	if t.isInactive() {
+		// Ignore broadcast - topic is paused or being deleted.
+		if msg.Data != nil {
+			msg.sess.queueOut(ErrLocked(msg.Id, t.original(asUid), msg.Timestamp))
+		}
+		return
+	}
+
+	var pushRcpt *push.Receipt
+	if msg.Data != nil {
+		if t.isReadOnly() {
+			msg.sess.queueOut(ErrPermissionDenied(msg.Id, t.original(asUid), msg.Timestamp))
+			return
+		}
+
+		asUser := types.ParseUserId(msg.Data.From)
+		userData, userFound := t.perUser[asUser]
+		// Anyone is allowed to post to 'sys' topic.
+		if t.cat != types.TopicCatSys {
+			// If it's not 'sys' check write permission.
+			if !(userData.modeWant & userData.modeGiven).IsWriter() {
+				msg.sess.queueOut(ErrPermissionDenied(msg.Id, t.original(asUid), msg.Timestamp))
+				return
+			}
+		}
+
+		if t.isProxy {
+			t.lastID = msg.Data.SeqId
+		} else {
+			// Save to DB at master topic.
+			if err := store.Messages.Save(&types.Message{
+				ObjHeader: types.ObjHeader{CreatedAt: msg.Data.Timestamp},
+				SeqId:     t.lastID + 1,
+				Topic:     t.name,
+				From:      asUser.String(),
+				Head:      msg.Data.Head,
+				Content:   msg.Data.Content}, (userData.modeGiven & userData.modeWant).IsReader()); err != nil {
+
+				log.Printf("topic[%s]: failed to save message: %v", t.name, err)
+				msg.sess.queueOut(ErrUnknown(msg.Id, t.original(asUid), msg.Timestamp))
+
+				return
+			}
+
+			t.lastID++
+			t.touched = msg.Data.Timestamp
+			msg.Data.SeqId = t.lastID
+		}
+
+		if userFound {
+			userData.readID = t.lastID
+			userData.readID = t.lastID
+			t.perUser[asUser] = userData
+		}
+
+		if msg.Id != "" && msg.sess != nil {
+			reply := NoErrAccepted(msg.Id, t.original(asUid), msg.Timestamp)
+			reply.Ctrl.Params = map[string]int{"seq": t.lastID}
+			msg.sess.queueOut(reply)
+		}
+
+		if !t.isProxy {
+			pushRcpt = t.pushForData(asUser, msg.Data)
+
+			// Message sent: notify offline 'R' subscrbers on 'me'.
+			t.presSubsOffline("msg", &presParams{seqID: t.lastID, actor: msg.Data.From},
+				&presFilters{filterIn: types.ModeRead}, nilPresFilters, "", true)
+
+			// Tell the plugins that a message was accepted for delivery
+			pluginMessage(msg.Data, plgActCreate)
+		}
+
+	} else if msg.Pres != nil {
+		what := t.presProcReq(msg.Pres.Src, msg.Pres.What, msg.Pres.WantReply)
+		if t.xoriginal != msg.Pres.Topic || what == "" {
+			// This is just a request for status, don't forward it to sessions
+			return
+		}
+
+		// "what" may have changed, i.e. unset or "+command" removed ("on+en" -> "on")
+		msg.Pres.What = what
+	} else if msg.Info != nil {
+		if msg.Info.SeqId > t.lastID {
+			// Drop bogus read notification
+			return
+		}
+
+		asUser := types.ParseUserId(msg.Info.From)
+		pud := t.perUser[asUser]
+
+		// Filter out "kp" from users with no 'W' permission (or people without a subscription)
+		if msg.Info.What == "kp" && (!(pud.modeGiven & pud.modeWant).IsWriter() || t.isReadOnly()) {
+			return
+		}
+
+		if msg.Info.What == "read" || msg.Info.What == "recv" {
+			// Filter out "read/recv" from users with no 'R' permission (or people without a subscription)
+			if !(pud.modeGiven & pud.modeWant).IsReader() {
+				return
+			}
+
+			var read, recv, unread int
+			if msg.Info.What == "read" {
+				if msg.Info.SeqId > pud.readID {
+					// The number of unread messages has decreased, negative value
+					unread = pud.readID - msg.Info.SeqId
+					pud.readID = msg.Info.SeqId
+					read = pud.readID
+				} else {
+					// No need to report stale or bogus read status
+					return
+				}
+			} else if msg.Info.What == "recv" {
+				if msg.Info.SeqId > pud.recvID {
+					pud.recvID = msg.Info.SeqId
+					recv = pud.recvID
+				} else {
+					return
+				}
+			}
+
+			if pud.readID > pud.recvID {
+				pud.recvID = pud.readID
+				recv = pud.recvID
+			}
+
+			if !t.isProxy {
+				if err := store.Subs.Update(t.name, asUser,
+					map[string]interface{}{
+						"RecvSeqId": pud.recvID,
+						"ReadSeqId": pud.readID},
+					false); err != nil {
+
+					log.Printf("topic[%s]: failed to update SeqRead/Recv counter: %v", t.name, err)
+					return
+				}
+
+				// Read/recv updated: notify user's other sessions of the change
+				t.presPubMessageCount(asUser, recv, read, msg.SkipSid)
+
+				// Update cached count of unread messages
+				usersUpdateUnread(asUser, unread, true)
+			}
+
+			t.perUser[asUser] = pud
+		}
+	} else {
+		// TODO(gene): remove this
+		log.Panic("topic: wrong message type for broadcasting", t.name)
+	}
+
+	// Broadcast the message. Only {data}, {pres}, {info} are broadcastable.
+	// {meta} and {ctrl} are sent to the session only
+	for sess, pssd := range t.sessions {
+		// Send all messages to multiplexing session.
+		if !sess.isMultiplex() {
+
+			if sess.sid == msg.SkipSid {
+				continue
+			}
+
+			if msg.Pres != nil {
+				// Skip notifying - already notified on topic.
+				if msg.Pres.SkipTopic != "" && sess.getSub(msg.Pres.SkipTopic) != nil {
+					continue
+				}
+
+				// Notification addressed to a single user only.
+				if msg.Pres.SingleUser != "" && pssd.uid.UserId() != msg.Pres.SingleUser {
+					continue
+				}
+				// Notification should skip a single user.
+				if msg.Pres.ExcludeUser != "" && pssd.uid.UserId() == msg.Pres.ExcludeUser {
+					continue
+				}
+
+				// Check presence filters
+				if !t.passesPresenceFilters(msg, pssd.uid) {
+					continue
+				}
+
+			} else {
+				// Check if the user has Read permission
+				if !t.userIsReader(pssd.uid) {
+					continue
+				}
+
+				// Don't send key presses from one user's session to the other sessions of the same user.
+				if msg.Info != nil && msg.Info.What == "kp" && msg.Info.From == pssd.uid.UserId() {
+					continue
+				}
+			}
+		}
+
+		// Topic name may be different depending on the user to which the `sess` belongs.
+		t.maybeFixTopicName(msg, pssd.uid)
+		if !sess.queueOut(msg) {
+			log.Println("topic: connection stuck, detaching", t.name, sess.sid)
+			// The whole session is being dropped, so sessionLeave.pkt is not set.
+			t.unreg <- &sessionLeave{sess: sess}
+		}
+	}
+
+	if !t.isProxy && pushRcpt != nil {
+		// usersPush will update unread message count and send push notification.
+		usersPush(pushRcpt)
+	}
+
+}
+
+// subscriptionReply generates a response to a subscription request
+func (t *Topic) subscriptionReply(h *Hub, join *sessionJoin) error {
 	// The topic is already initialized by the Hub
-	var now time.Time
+
+	msgsub := join.pkt.Sub
+
 	// For newly created topics report topic creation time.
-	if sreg.created {
+	var now time.Time
+	if msgsub.Created {
 		now = t.updated
 	} else {
 		now = types.TimeNow()
 	}
 
-	msgsub := sreg.pkt.Sub
-	asUid := types.ParseUserId(sreg.pkt.asUser)
-	asLvl := auth.Level(sreg.pkt.authLvl)
+	asUid := types.ParseUserId(join.pkt.AsUser)
+	asLvl := auth.Level(join.pkt.AuthLvl)
 	toriginal := t.original(asUid)
 
-	if !sreg.newsub && (t.cat == types.TopicCatP2P || t.cat == types.TopicCatGrp || t.cat == types.TopicCatSys) {
+	if !msgsub.Newsub && (t.cat == types.TopicCatP2P || t.cat == types.TopicCatGrp || t.cat == types.TopicCatSys) {
 		// Check if this is a new subscription.
 		pud, found := t.perUser[asUid]
-		sreg.newsub = !found || pud.deleted
+		msgsub.Newsub = !found || pud.deleted
 	}
 
 	var private interface{}
@@ -880,7 +994,7 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
 	if msgsub.Set != nil {
 		if msgsub.Set.Sub != nil {
 			if msgsub.Set.Sub.User != "" {
-				sreg.sess.queueOut(ErrMalformed(sreg.pkt.id, toriginal, now))
+				join.sess.queueOut(ErrMalformed(join.pkt.Id, toriginal, now))
 				return errors.New("user id must not be specified")
 			}
 
@@ -895,7 +1009,7 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
 	var err error
 	var changed bool
 	// Create new subscription or modify an existing one.
-	if changed, err = t.thisUserSub(h, sreg.sess, asUid, asLvl, sreg.pkt.id, mode, private, msgsub.Background); err != nil {
+	if changed, err = t.thisUserSub(h, join.sess, asUid, asLvl, join.pkt.Id, mode, private); err != nil {
 		return err
 	}
 
@@ -912,8 +1026,8 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
 
 	// When a group topic is created, it's given a temporary name by the client.
 	// Then this name changes. Report back the original name here.
-	if sreg.created && sreg.pkt.topic != toriginal {
-		params["tmpname"] = sreg.pkt.topic
+	if msgsub.Created && join.pkt.Original != toriginal {
+		params["tmpname"] = join.pkt.Original
 	}
 
 	if len(params) == 0 {
@@ -921,7 +1035,7 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
 		params = nil
 	}
 
-	sreg.sess.queueOut(NoErrParams(sreg.pkt.id, toriginal, now, params))
+	join.sess.queueOut(NoErrParams(join.pkt.Id, toriginal, now, params))
 
 	return nil
 }
@@ -930,14 +1044,15 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
 // result of {sub} or {meta set=sub}.
 // Returns changed == true if user's accessmode has changed.
 //
-//	h			- hub
-//	sess		- originating session
-//	asUid		- id of the user making the request
-//	asLvl		- access level of the user making the request
-//	pktID		- id of {sub} or {set} packet
-//	want		- requested access mode
-//	private		- private value to assign to the subscription
-//	background	- presence notifications are deferred
+//	h							- hub
+//	sess					- originating session
+//	asUid					- id of the user making the request
+//	asLvl					- access level of the user making the request
+//	pktID					- id of {sub} or {set} packet
+//	want					- requested access mode
+//	private				- private value to assign to the subscription
+//	background   	- presence notifications are deferred
+//	sessOverrides - session param overrides
 //
 // Handle these cases:
 // A. User is trying to subscribe for the first time (no subscription)
@@ -946,7 +1061,7 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin) error {
 // D. User is already subscribed, changing modeWant
 // E. User is accepting ownership transfer (requesting ownership transfer is not permitted)
 func (t *Topic) thisUserSub(h *Hub, sess *Session, asUid types.Uid, asLvl auth.Level,
-	pktID, want string, private interface{}, background bool) (bool, error) {
+	pktID, want string, private interface{}) (bool, error) {
 
 	now := types.TimeNow()
 	toriginal := t.original(asUid)
@@ -970,7 +1085,6 @@ func (t *Topic) thisUserSub(h *Hub, sess *Session, asUid types.Uid, asLvl auth.L
 	// It could be an actual subscription (IsJoiner() == true) or a ban (IsJoiner() == false)
 	userData, existingSub := t.perUser[asUid]
 	if !existingSub || userData.deleted {
-
 		// Check if the max number of subscriptions is already reached.
 		if t.cat == types.TopicCatGrp && t.subsCount() >= globals.maxSubscriberCount {
 			sess.queueOut(ErrPolicy(pktID, toriginal, now))
@@ -1099,7 +1213,6 @@ func (t *Topic) thisUserSub(h *Hub, sess *Session, asUid types.Uid, asLvl auth.L
 		if modeWant == types.ModeUnset {
 			// If the user has self-banned before, un-self-ban. Otherwise do not make a change.
 			if !oldWant.IsJoiner() {
-				log.Println("No J permissions before")
 				// Set permissions NO WORSE than default, but possibly better (admin or owner banned himself).
 				userData.modeWant = userData.modeGiven | t.accessFor(asLvl)
 			}
@@ -1194,11 +1307,11 @@ func (t *Topic) thisUserSub(h *Hub, sess *Session, asUid types.Uid, asLvl auth.L
 		broadcast: t.broadcast,
 		done:      t.unreg,
 		meta:      t.meta,
-		uaChange:  t.uaChange})
+		supd:      t.supd})
 	t.addSession(sess, asUid)
 
 	// The user is online in the topic. Increment the counter if notifications are not deferred.
-	if !background {
+	if !sess.background {
 		userData.online++
 		t.perUser[asUid] = userData
 	}
@@ -1270,7 +1383,6 @@ func (t *Topic) anotherUserSub(h *Hub, sess *Session, asUid, target types.Uid, s
 	// Saved subscription does not mean the user is allowed to post/read
 	userData, existingSub := t.perUser[target]
 	if !existingSub {
-
 		// Check if the max number of subscriptions is already reached.
 		if t.cat == types.TopicCatGrp && t.subsCount() >= globals.maxSubscriberCount {
 			sess.queueOut(ErrPolicy(set.Id, toriginal, now))
@@ -1318,6 +1430,7 @@ func (t *Topic) anotherUserSub(h *Hub, sess *Session, asUid, target types.Uid, s
 			private:   nil,
 		}
 		t.perUser[target] = userData
+		t.computePerUserAcsUnion()
 
 		// Cache user's record
 		usersRegisterUser(target, true)
@@ -1363,7 +1476,6 @@ func (t *Topic) anotherUserSub(h *Hub, sess *Session, asUid, target types.Uid, s
 			// Increment unread count
 			usersUpdateUnread(target, t.lastID-userData.readID, true)
 		}
-
 		t.notifySubChange(target, asUid, oldWant, oldGiven, userData.modeWant, userData.modeGiven, sess.sid)
 	}
 
@@ -1396,9 +1508,7 @@ func (t *Topic) replyGetDesc(sess *Session, asUid types.Uid, id string, opts *Ms
 	}
 
 	pud, full := t.perUser[asUid]
-	if t.cat == types.TopicCatP2P && !full {
-		log.Println("missing p2p subscription in getDesc")
-	}
+
 	if t.cat == types.TopicCatMe {
 		full = true
 	}
@@ -1891,15 +2001,15 @@ func (t *Topic) replyGetSub(sess *Session, asUid types.Uid, authLevel auth.Level
 func (t *Topic) replySetSub(h *Hub, sess *Session, pkt *ClientComMessage) error {
 	now := types.TimeNow()
 
-	asUid := types.ParseUserId(pkt.asUser)
-	asLvl := auth.Level(pkt.authLvl)
+	asUid := types.ParseUserId(pkt.AsUser)
+	asLvl := auth.Level(pkt.AuthLvl)
 	set := pkt.Set
 	toriginal := t.original(asUid)
 
 	var target types.Uid
 	if target = types.ParseUserId(set.Sub.User); target.IsZero() && set.Sub.User != "" {
 		// Invalid user ID
-		sess.queueOut(ErrMalformed(pkt.id, toriginal, now))
+		sess.queueOut(ErrMalformed(pkt.Id, toriginal, now))
 		return errors.New("invalid user id")
 	}
 
@@ -1912,7 +2022,7 @@ func (t *Topic) replySetSub(h *Hub, sess *Session, pkt *ClientComMessage) error 
 	var changed bool
 	if target == asUid {
 		// Request new subscription or modify own subscription
-		changed, err = t.thisUserSub(h, sess, asUid, asLvl, pkt.id, set.Sub.Mode, nil, false)
+		changed, err = t.thisUserSub(h, sess, asUid, asLvl, pkt.Id, set.Sub.Mode, nil)
 	} else {
 		// Request to approve/change someone's subscription
 		changed, err = t.anotherUserSub(h, sess, asUid, target, set)
@@ -1932,9 +2042,9 @@ func (t *Topic) replySetSub(h *Hub, sess *Session, pkt *ClientComMessage) error 
 		if target != asUid {
 			params["user"] = target.UserId()
 		}
-		resp = NoErrParams(pkt.id, toriginal, now, params)
+		resp = NoErrParams(pkt.Id, toriginal, now, params)
 	} else {
-		resp = InfoNotModified(pkt.id, toriginal, now)
+		resp = InfoNotModified(pkt.Id, toriginal, now)
 	}
 
 	sess.queueOut(resp)
@@ -2323,9 +2433,7 @@ func (t *Topic) replyDelCred(h *Hub, sess *Session, asUid types.Uid, authLvl aut
 		sess.queueOut(InfoNoAction(del.Id, del.Topic, now))
 		return nil
 	}
-
 	sess.queueOut(decodeStoreError(err, del.Id, del.Topic, now, nil))
-
 	return err
 }
 
@@ -2402,6 +2510,10 @@ func (t *Topic) replyDelSub(h *Hub, sess *Session, asUid types.Uid, del *MsgClie
 func (t *Topic) replyLeaveUnsub(h *Hub, sess *Session, asUid types.Uid, id string) error {
 	now := types.TimeNow()
 
+	if asUid.IsZero() {
+		panic("replyLeaveUnsub: zero asUid")
+	}
+
 	if t.owner == asUid {
 		if id != "" {
 			sess.queueOut(ErrPermissionDenied(id, t.original(asUid), now))
@@ -2457,6 +2569,7 @@ func (t *Topic) evictUser(uid types.Uid, unsub bool, skip string) {
 		} else {
 			// Grp: delete per-user data
 			delete(t.perUser, uid)
+			t.computePerUserAcsUnion()
 
 			usersRegisterUser(uid, false)
 		}
@@ -2469,11 +2582,15 @@ func (t *Topic) evictUser(uid types.Uid, unsub bool, skip string) {
 	// Detach all user's sessions
 	msg := NoErrEvicted("", t.original(uid), now)
 	msg.Ctrl.Params = map[string]interface{}{"unsub": unsub}
-	for sess := range t.sessions {
-		if t.remSession(sess, uid) != nil {
-			sess.detach <- t.name
-			if sess.sid != skip {
-				sess.queueOut(msg)
+	msg.SkipSid = skip
+	msg.uid = uid
+	for s := range t.sessions {
+		if pssd, removed := t.remSession(s, uid); pssd != nil {
+			if removed {
+				s.detach <- t.name
+			}
+			if s.sid != skip {
+				s.queueOut(msg)
 			}
 		}
 	}
@@ -2607,14 +2724,18 @@ func (t *Topic) pushForData(fromUid types.Uid, data *MsgServerData) *push.Receip
 			ContentType: contentType,
 			Content:     data.Content}}
 
-	for uid := range t.perUser {
+	for uid, pud := range t.perUser {
 		// Send only to those who have notifications enabled, exclude the originating user.
 		if uid == fromUid {
 			continue
 		}
-		mode := t.perUser[uid].modeWant & t.perUser[uid].modeGiven
-		if mode.IsPresencer() && mode.IsReader() && !t.perUser[uid].deleted {
-			receipt.To[uid] = push.Recipient{}
+		mode := pud.modeWant & pud.modeGiven
+		if mode.IsPresencer() && mode.IsReader() && !pud.deleted {
+			receipt.To[uid] = push.Recipient{
+				// Number of sessions this data message will be delivered to.
+				// Push notifications sent to users with non-zero online sessions will be marked silent.
+				Delivered: pud.online,
+			}
 		}
 	}
 	if len(receipt.To) > 0 {
@@ -2651,6 +2772,7 @@ func (t *Topic) pushForSub(fromUid, toUid types.Uid, want, given types.AccessMod
 	return &receipt
 }
 
+// FIXME: this won't work correctly with multiplexing sessions.
 func (t *Topic) mostRecentSession() *Session {
 	var sess *Session
 	var latest time.Time
@@ -2807,19 +2929,18 @@ func (t *Topic) fndSetPublic(sess *Session, public interface{}) bool {
 
 }
 
-// Remove per-session value of fnd.Public
+// Remove per-session value of fnd.Public.
 func (t *Topic) fndRemovePublic(sess *Session) {
-	if t.cat == types.TopicCatFnd {
-		if t.public == nil {
-			return
-		}
-		if pubmap, ok := t.public.(map[string]interface{}); ok {
-			delete(pubmap, sess.sid)
-			return
-		}
-		panic("Invalid Fnd.Public type")
+	if t.public == nil {
+		return
 	}
-	panic("Not Fnd topic")
+	// FIXME: case of a multiplexing session won't work correctly.
+	// Maybe handle it at the proxy topic.
+	if pubmap, ok := t.public.(map[string]interface{}); ok {
+		delete(pubmap, sess.sid)
+		return
+	}
+	panic("Invalid Fnd.Public type")
 }
 
 func (t *Topic) accessFor(authLvl auth.Level) types.AccessMode {
@@ -2840,33 +2961,77 @@ func (t *Topic) subsCount() int {
 	return len(t.perUser)
 }
 
-// Add session record. 'user' may be different from s.uid.
-func (t *Topic) addSession(s *Session, asUid types.Uid) bool {
-	if _, ok := t.sessions[s]; ok {
-		return false
+// Add session record. 'user' may be different from sess.uid.
+func (t *Topic) addSession(sess *Session, asUid types.Uid) {
+	s := sess
+	if sess.multi != nil {
+		s = s.multi
 	}
-	t.sessions[s] = perSessionData{uid: asUid}
-	return true
-}
 
-// Removes session record if 'asUid' matches subscribed user.
-func (t *Topic) remSession(s *Session, asUid types.Uid) *perSessionData {
-	if pssd, ok := t.sessions[s]; ok && (pssd.uid == asUid || asUid.IsZero()) {
-		// Check for deferred presence notification and cancel it if found.
-		if pssd.ref != nil {
-			t.defrNotif.Remove(pssd.ref)
+	if pssd, ok := t.sessions[s]; ok {
+		// Subscription already exists.
+		if s.isMultiplex() && !sess.background {
+			// This slice is expected to be relatively short.
+			// Not doing anything fancy here like maps or sorting.
+			pssd.muids = append(pssd.muids, asUid)
 		}
-		delete(t.sessions, s)
-		return &pssd
+		// Maybe panic here.
+		return
 	}
-	return nil
+
+	if s.isMultiplex() {
+		if sess.background {
+			t.sessions[s] = perSessionData{}
+		} else {
+			t.sessions[s] = perSessionData{muids: []types.Uid{asUid}}
+		}
+	} else {
+		t.sessions[s] = perSessionData{uid: asUid}
+	}
 }
 
+// Disconnects session from topic if either one of the following is true:
+// * 's' is an ordinary session AND ('asUid' is zero OR 'asUid' matches subscribed user).
+// * 's' is a multiplexing session and it's being dropped all together ('asUid' is zero ).
+// If 's' is a multiplexing session and asUid is not zero, it's removed from the list of session
+// users 'muids'.
+// Returns perSessionData if it was found and true if session was actually detached from topic.
+func (t *Topic) remSession(sess *Session, asUid types.Uid) (*perSessionData, bool) {
+	s := sess
+	if sess.multi != nil {
+		s = s.multi
+	}
+	pssd, ok := t.sessions[s]
+	if !ok {
+		// Session not found at all.
+		return nil, false
+	}
+
+	if pssd.uid == asUid || asUid.IsZero() {
+		delete(t.sessions, s)
+		return &pssd, true
+	}
+
+	for i := range pssd.muids {
+		if pssd.muids[i] == asUid {
+			pssd.muids[i] = pssd.muids[len(pssd.muids)-1]
+			pssd.muids = pssd.muids[:len(pssd.muids)-1]
+			t.sessions[s] = pssd
+			return &pssd, false
+		}
+	}
+
+	return nil, false
+}
+
+// Check if topic has any online (non-background) users.
 func (t *Topic) isOnline() bool {
-	// Some sessions may be background sessions. They should not be counted.
-	for _, pssd := range t.sessions {
-		// At least one non-background session.
-		if pssd.ref == nil {
+	// Find at least one non-background session.
+	for s, pssd := range t.sessions {
+		if s.isMultiplex() && len(pssd.muids) > 0 {
+			return true
+		}
+		if !s.background {
 			return true
 		}
 	}
